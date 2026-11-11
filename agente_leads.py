@@ -2,7 +2,7 @@ import os
 import re
 import time
 import xmlrpc.client
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -91,7 +91,7 @@ def analizar_lead_con_ia(lead, info_internet):
     """
 
     response = client_ai.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
