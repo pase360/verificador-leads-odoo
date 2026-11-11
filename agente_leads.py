@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import xmlrpc.client
 from duckduckgo_search import DDGS
@@ -14,13 +15,13 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 40  # Lote seguro para no exceder límites gratuitos en una sola corrida
+MAX_LEADS_POR_EJECUCION = 40  # Lote seguro para no exceder límites gratuitos
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
 class ResultadoValidacion(BaseModel):
     email_corregido_o_encontrado: str
-    telefono_corregido_o_encontrado: str
+    celular_corregido_o_encontrado: str
     datos_validos_y_verificados: bool
     motivo: str
 
@@ -29,6 +30,20 @@ def conectar_odoo():
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
+
+def limpiar_formato_celular(numero):
+    if not numero:
+        return ""
+    solo_digitos = re.sub(r'\D', '', str(numero))
+    if solo_digitos.startswith("549") and len(solo_digitos) == 13:
+        return f"+{solo_digitos}"
+    if solo_digitos.startswith("54") and len(solo_digitos) == 12:
+        return f"+549{solo_digitos[2:]}"
+    if solo_digitos.startswith("0") and len(solo_digitos) == 11:
+        return f"+549{solo_digitos[1:]}"
+    if len(solo_digitos) == 10:
+        return f"+549{solo_digitos}"
+    return ""
 
 def buscar_en_internet_gratis(query):
     try:
@@ -44,7 +59,7 @@ def buscar_en_internet_gratis(query):
 
 def analizar_lead_con_ia(lead, info_internet):
     prompt = f"""
-    Eres un auditor de datos CRM experto. Analiza este lead de Odoo y compáralo con los resultados de búsqueda en internet (en Córdoba / Argentina).
+    Eres un auditor de datos CRM experto en Argentina. Analiza este lead de Odoo y compáralo con los resultados de búsqueda en internet (en Córdoba / Argentina).
 
     DATOS ACTUALES EN ODOO:
     - Nombre del Lead: {lead.get('name')}
@@ -52,21 +67,27 @@ def analizar_lead_con_ia(lead, info_internet):
     - Ciudad / País: {lead.get('city') or 'Córdoba'} {lead.get('country_id') if lead.get('country_id') else 'Argentina'}
     - Web: {lead.get('website') or 'No especificado'}
     - Email actual: {lead.get('email_from') or 'VACÍO'}
-    - Teléfono actual: {lead.get('phone') or lead.get('mobile') or 'VACÍO'}
+    - Teléfono actual: {lead.get('phone') or 'VACÍO'}
 
     RESULTADOS EN INTERNET:
     {info_internet}
 
     REGLAS ESTRICTAS DE VALIDACIÓN:
-    1. Si falta el email o el teléfono, búscalos en los resultados de internet y complétalos. Si no aparecen con certeza, déjalos vacíos ("").
-    2. Si ya tiene email o teléfono, verifica en los resultados que pertenezcan realmente a esa empresa/persona y no tengan errores de tipeo ni sean falsos. Corrígelos si ves un error evidente en internet.
+    1. TELÉFONOS (SOLO CELULARES):
+       - IGNORA Y DESCARTA POR COMPLETO cualquier teléfono fijo (por ejemplo, números de Córdoba que empiezan con 0351 4..., 03573 4..., o números de línea fija sin 15/9). Nunca devuelvas un número fijo.
+       - Busca únicamente teléfonos CELULARES o WhatsApp (números con 15, +54 9, o celulares de Argentina).
+       - Si encuentras un celular o si el teléfono actual es un celular válido, devuélvelo SIEMPRE en el formato exacto sin espacios ni guiones: +549 + código de área sin 0 + número sin 15 (Ejemplo exacto: +5493573412724 o +5493511234567).
+       - Si el teléfono actual en Odoo es un número fijo y no encuentras un celular en internet, devuelve "" en celular_corregido_o_encontrado.
+    2. EMAILS:
+       - Si falta el email, búscalo en los resultados de internet y complétalo. Si no aparece con certeza, déjalo vacío ("").
+       - Si ya tiene email, verifica que pertenezca a esa empresa/persona y corrígelo si hay un error evidente.
     3. 'datos_validos_y_verificados' debe ser TRUE únicamente si:
-       - Lograste confirmar en internet que los datos presentes son reales y correctos.
-       - Si faltaba un dato y no lo encontraste, pero el dato que SÍ tenía pudo ser verificado como correcto en internet, también pon TRUE.
+       - Lograste confirmar en internet que los datos presentes (celular y/o email) son reales y correctos.
+       - Si faltaba un dato y no lo encontraste, pero el dato que SÍ tenía (celular válido o email) pudo ser verificado como correcto en internet, también pon TRUE.
     4. 'datos_validos_y_verificados' debe ser FALSE si:
        - No pudiste confirmar ninguno de los datos en internet.
-       - Detectaste que el teléfono o email cargado es incorrecto/inválido y no pudiste encontrar el real para reemplazarlo.
-       - El lead quedó sin email y sin teléfono.
+       - Detectaste que el dato cargado es incorrecto o es solo un teléfono fijo sin email válido.
+       - El lead quedó sin email y sin celular.
     """
 
     response = client_ai.models.generate_content(
@@ -84,7 +105,6 @@ def ejecutar_agente():
     print("Conectando a Odoo...")
     uid, models = conectar_odoo()
 
-    # 1. Buscar el ID de la etapa "Prospectos"
     etapas = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.stage', 'search_read',
         [[['name', 'ilike', 'Prospectos']]], {'fields': ['id', 'name'], 'limit': 1}
@@ -97,8 +117,7 @@ def ejecutar_agente():
     id_prospectos = etapas[0]['id']
     print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})")
 
-    # 2. Traer leads en Prospectos (de a lotes para cuidar el límite gratuito)
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'mobile', 'website', 'city', 'country_id']
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'city', 'country_id']
     leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
         [[['stage_id', '=', id_prospectos]]], {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION}
@@ -109,7 +128,7 @@ def ejecutar_agente():
     for lead in leads:
         print(f"\n--- Revisando Lead ID {lead['id']}: {lead['name']} ---")
         ciudad = lead.get('city') or 'Cordoba Argentina'
-        termino_busqueda = f"{lead.get('partner_name') or lead.get('name')} {ciudad} contacto telefono email"
+        termino_busqueda = f"{lead.get('partner_name') or lead.get('name')} {ciudad} whatsapp celular contacto email"
         
         info_internet = buscar_en_internet_gratis(termino_busqueda)
         
@@ -120,35 +139,29 @@ def ejecutar_agente():
             time.sleep(10)
             continue
 
-        print(f"Resultado IA: Válido={resultado.datos_validos_y_verificados} | Motivo: {resultado.motivo}")
+        celular_formateado = limpiar_formato_celular(resultado.celular_corregido_o_encontrado)
+        print(f"Resultado IA: Válido={resultado.datos_validos_y_verificados} | Celular={celular_formateado} | Motivo: {resultado.motivo}")
 
         valores_actualizar = {}
 
-        # Actualizar email si se encontró o corrigió
         if resultado.email_corregido_o_encontrado and resultado.email_corregido_o_encontrado != lead.get('email_from'):
             valores_actualizar['email_from'] = resultado.email_corregido_o_encontrado
 
-        # Actualizar teléfono si se encontró o corrigió
-        telefono_actual = lead.get('phone') or lead.get('mobile')
-        if resultado.telefono_corregido_o_encontrado and resultado.telefono_corregido_o_encontrado != telefono_actual:
-            valores_actualizar['phone'] = resultado.telefono_corregido_o_encontrado
+        if celular_formateado and celular_formateado != lead.get('phone'):
+            valores_actualizar['phone'] = celular_formateado
 
-        # Mover de etapa solo si pasó la verificación
         if resultado.datos_validos_y_verificados:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
             print(f"-> Lead aprobado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.")
         else:
             print("-> Lead NO aprobado o incompleto. Se mantiene en Prospectos para seguir chequeando.")
 
-        # Guardar cambios en Odoo
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
         
-        # Dejar nota interna en el historial del lead
         mensaje_nota = f"<b>Agente de Verificación:</b> {resultado.motivo}"
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
 
-        # Pausa de 5 segundos para respetar el límite gratuito de velocidad de Gemini
         time.sleep(5)
 
 if __name__ == "__main__":
