@@ -2,6 +2,7 @@ import os
 import re
 import time
 import xmlrpc.client
+import requests
 from ddgs import DDGS
 from google import genai
 from google.genai import types
@@ -15,7 +16,7 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 50  # Lote equilibrado para hacer búsquedas profundas sin saturar
+MAX_LEADS_POR_EJECUCION = 50  # Lote de control
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -34,7 +35,12 @@ def conectar_odoo():
 def limpiar_formato_celular(numero):
     if not numero:
         return ""
+    es_positivo = str(numero).strip().startswith("+")
     solo_digitos = re.sub(r'\D', '', str(numero))
+    
+    if not solo_digitos:
+        return ""
+        
     if solo_digitos.startswith("549") and len(solo_digitos) == 13:
         return f"+{solo_digitos}"
     if solo_digitos.startswith("54") and len(solo_digitos) == 12:
@@ -43,64 +49,87 @@ def limpiar_formato_celular(numero):
         return f"+549{solo_digitos[1:]}"
     if len(solo_digitos) == 10:
         return f"+549{solo_digitos}"
+        
+    return f"+{solo_digitos}" if es_positivo else solo_digitos
+
+def extraer_texto_de_url(url):
+    """Navega y entra directamente a la página web para extraer el texto y enlaces ocultos"""
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            texto = response.text
+            # Buscar enlaces ocultos de botones de WhatsApp (ej: wa.me/549...)
+            whatsapp_links = re.findall(r'(?:wa\.me|api\.whatsapp\.com/send\?phone=)([0-9]+)', texto)
+            info_extra = ""
+            if whatsapp_links:
+                info_extra = f"\n[ENLACES DE BOTÓN DE WHATSAPP ENCONTRADOS EN LA WEB: {', '.join(whatsapp_links)}]\n"
+            
+            # Limpiar etiquetas HTML para quedarse solo con el texto visible
+            texto_limpio = re.sub(r'<[^>]+>', ' ', texto)
+            texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
+            return f"{info_extra} Contenido de la web: {texto_limpio[:4000]}" # Lee hasta 4000 caracteres de la página
+    except Exception as e:
+        return f"[No se pudo acceder a la web: {str(e)}]"
     return ""
 
 def ejecutar_consulta_ddgs(query, max_res=6):
     try:
         resultados = DDGS().text(query, region="ar-es", max_results=max_res)
         if not resultados:
-            return ""
-        snippets = []
-        for item in resultados:
-            snippets.append(f"- Título: {item.get('title')} | Desc: {item.get('body')} | Link: {item.get('href')}")
-        return "\n".join(snippets)
+            return []
+        return resultados
     except Exception:
-        return ""
+        return []
 
-def investigacion_exhaustiva_internet(lead):
+def investigacion_exhaustiva_y_scraping(lead):
     nombre = lead.get('partner_name') or lead.get('name') or ''
     ciudad = lead.get('city') or 'Cordoba Argentina'
-    web = lead.get('website') or ''
-    falta_email = not bool(lead.get('email_from'))
-    falta_celular = not bool(limpiar_formato_celular(lead.get('phone')))
-
-    reporte_busquedas = []
-
-    # Ronda 1: Búsqueda general de contacto
-    q1 = f'"{nombre}" {ciudad} contacto whatsapp telefono email'
-    res1 = ejecutar_consulta_ddgs(q1, max_res=6)
-    if res1:
-        reporte_busquedas.append(f"=== BÚSQUEDA GENERAL ===\n{res1}")
-    time.sleep(1.5)
-
-    # Ronda 2: Búsqueda profunda en Redes Sociales (Instagram y Facebook)
-    if falta_email or falta_celular:
-        q2 = f'"{nombre}" {ciudad} (site:instagram.com OR site:facebook.com)'
-        res2 = ejecutar_consulta_ddgs(q2, max_res=6)
-        if res2:
-            reporte_busquedas.append(f"=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n{res2}")
-        time.sleep(1.5)
-
-    # Ronda 3: Búsqueda específica de correo electrónico o sitio web oficial
-    if falta_email:
-        if web:
-            dominio = web.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
-            q3 = f'"{dominio}" OR "{nombre}" "@"'
-        else:
-            q3 = f'"{nombre}" {ciudad} ("@gmail.com" OR "@hotmail.com" OR "email" OR "correo")'
-        res3 = ejecutar_consulta_ddgs(q3, max_res=6)
-        if res3:
-            reporte_busquedas.append(f"=== BÚSQUEDA ESPECÍFICA DE EMAIL ===\n{res3}")
-        time.sleep(1.5)
-
-    if not reporte_busquedas:
-        return "No se encontraron resultados tras realizar múltiples búsquedas en web y redes sociales."
+    web_actual = lead.get('website') or ''
     
-    return "\n\n".join(reporte_busquedas)
+    reporte_total = []
+    urls_encontradas = []
+    
+    if web_actual.startswith("http"):
+        urls_encontradas.append(web_actual)
+
+    # Ronda 1: Búsqueda general
+    q1 = f'"{nombre}" {ciudad} contacto whatsapp telefono email'
+    resultados1 = ejecutar_consulta_ddgs(q1, max_res=5)
+    
+    snippets = []
+    for item in resultados1:
+        link = item.get('href', '')
+        snippets.append(f"- Título: {item.get('title')} | Desc: {item.get('body')} | Link: {link}")
+        if link.startswith("http") and "instagram" not in link and "facebook" not in link and len(urls_encontradas) < 3:
+            urls_encontradas.append(link)
+            
+    reporte_total.append(f"=== RESULTADOS DE BÚSQUEDA EN INTERNET ===\n" + "\n".join(snippets))
+    time.sleep(1)
+
+    # Ronda 2: Redes Sociales
+    q2 = f'"{nombre}" {ciudad} (site:instagram.com OR site:facebook.com)'
+    resultados2 = ejecutar_consulta_ddgs(q2, max_res=4)
+    if resultados2:
+        snippets_redes = [f"- {i.get('title')}: {i.get('body')}" for i in resultados2]
+        reporte_total.append(f"=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n" + "\n".join(snippets_redes))
+    time.sleep(1)
+
+    # PASO CLAVE: ENTRAR A LAS WEBS ENCONTRADAS Y EXTRAER CONTENIDO INTERNO
+    for url in list(set(urls_encontradas)):
+        print(f"-> Entrando e investigando la web interna: {url}", flush=True)
+        contenido_interno = extraer_texto_de_url(url)
+        if contenido_interno:
+            reporte_total.append(f"=== CONTENIDO REAL DENTRO DE LA WEB ({url}) ===\n{contenido_interno}")
+        time.sleep(1)
+
+    return "\n\n".join(reporte_total)
 
 def analizar_lead_con_ia(lead, info_internet):
     prompt = f"""
-    Eres un investigador de datos CRM experto en Córdoba, Argentina. Tu trabajo es encontrar el EMAIL y el CELULAR faltantes revisando a fondo los resultados de web, Instagram y Facebook.
+    Eres un investigador de datos CRM experto en Córdoba, Argentina. Tu trabajo es consolidar el EMAIL y el TELÉFONO/WHATSAPP del lead basándote en los datos de internet y el contenido extraído de sus páginas web.
 
     DATOS ACTUALES EN ODOO:
     - Nombre del Lead: {lead.get('name')}
@@ -110,21 +139,19 @@ def analizar_lead_con_ia(lead, info_internet):
     - Email actual: {lead.get('email_from') or 'VACÍO'}
     - Teléfono actual: {lead.get('phone') or 'VACÍO'}
 
-    RESULTADOS DE INVESTIGACIÓN EXHAUSTIVA:
+    RESULTADOS DE INVESTIGACIÓN Y SCRAPING INTERNO DE WEBS:
     {info_internet}
 
-    REGLAS ESTRICTAS DE EXTRACCIÓN Y VALIDACIÓN:
-    1. TELÉFONOS (SOLO CELULARES):
-       - IGNORA Y DESCARTA POR COMPLETO cualquier teléfono fijo (ej. números de Córdoba que empiezan con 0351 4..., 03573 4..., o líneas fijas sin 15/9). Nunca devuelvas un número fijo.
-       - Revisa con lupa las descripciones de Instagram, Facebook y directorios para rescatar cualquier número de WhatsApp o celular (con 15, +54 9, o 351/3573 seguido de 7 dígitos).
-       - Devuélvelo SIEMPRE en el formato exacto sin espacios ni guiones: +549 + código de área sin 0 + número sin 15 (Ejemplo: +5493573412724).
-       - Si el teléfono actual en Odoo es un número fijo y no encontraste un celular en internet, devuelve "".
+    REGLAS DE EXTRACCIÓN Y COINCIDENCIA:
+    1. TELÉFONOS Y WHATSAPP:
+       - Revisa minuciosamente la sección [ENLACES DE BOTÓN DE WHATSAPP ENCONTRADOS EN LA WEB]. Si hay números allí, extrae el número de contacto principal de la entidad.
+       - Si el número actual o el encontrado en el texto de la web/redes figura como canal de atención, WhatsApp o contacto directo, ES TOTALMENTE VÁLIDO. No lo descartes por su prefijo.
+       - Devuélvelo en formato numérico limpio (Ej: +5493518738200 o +5493573412724).
     2. EMAILS:
-       - Revisa cada línea de los resultados (especialmente biografías de Instagram, páginas de Facebook y webs) para rescatar cualquier dirección de correo electrónico perteneciente al comercio o entidad.
-       - Si ya tiene email, verifica que sea real y corrígelo si ves un error evidente. Si no aparece ninguno tras toda la investigación, devuelve "".
-    3. CONDICIÓN OBLIGATORIA PARA APROBAR ('datos_validos_y_verificados' = TRUE):
-       - Debe quedar con AMBOS DATOS COMPLETOS Y VERIFICADOS (Email Y Celular válido).
-       - Si después de investigar sigue faltando el Email o sigue faltando el Celular, pon obligatoriamente FALSE para que permanezca en Prospectos.
+       - Busca direcciones de correo electrónico corporativas o de Gmail en el contenido interno de las webs analizadas y complétalo.
+    3. CONDICIÓN DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
+       - Debe ser TRUE si el lead cuenta con Correo Electrónico Y Teléfono/WhatsApp de contacto confirmados y válidos para recibir invitaciones.
+       - Si tras buscar y raspar las webs falta el email o el teléfono de manera absoluta en internet, pon FALSE para que quede en revisión.
     """
 
     response = client_ai.models.generate_content(
@@ -151,8 +178,8 @@ def ejecutar_agente():
         print("Error: No se encontró ninguna etapa llamada 'Prospectos'.", flush=True)
         return
 
-    id_prospectos = etapas[0]['id']
-    print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})", flush=True)
+    id_prospectos = etapas['id']
+    print(f"Etapa encontrada: {etapas['name']} (ID: {id_prospectos})", flush=True)
 
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'city', 'country_id']
     leads = models.execute_kw(
@@ -161,12 +188,12 @@ def ejecutar_agente():
         {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'write_date asc'}
     )
 
-    print(f"Iniciando investigación exhaustiva en un lote de {len(leads)} leads...", flush=True)
+    print(f"Iniciando investigación profunda y scraping en {len(leads)} leads...", flush=True)
 
     for lead in leads:
-        print(f"\n--- Investigando a fondo Lead ID {lead['id']}: {lead['name']} ---", flush=True)
+        print(f"\n--- Investigando a fondo y navegando webs del Lead ID {lead['id']}: {lead['name']} ---", flush=True)
         
-        info_internet = investigacion_exhaustiva_internet(lead)
+        info_internet = investigacion_exhaustiva_y_scraping(lead)
         
         try:
             resultado = analizar_lead_con_ia(lead, info_internet)
@@ -186,7 +213,7 @@ def ejecutar_agente():
 
         if not tiene_email or not tiene_celular:
             aprobado_final = False
-            motivo_ajustado = f"{resultado.motivo} [Sigue en Prospectos: falta {'Email' if not tiene_email else 'Celular'} tras búsqueda profunda]."
+            motivo_ajustado = f"{resultado.motivo} [Sigue en Prospectos: falta {'Email' if not tiene_email else 'Teléfono'} tras análisis interno web]."
         else:
             aprobado_final = resultado.datos_validos_y_verificados
             motivo_ajustado = resultado.motivo
@@ -198,22 +225,8 @@ def ejecutar_agente():
         if email_final and email_final != email_actual:
             valores_actualizar['email_from'] = email_final
 
-        if celular_formateado and celular_formateado != lead.get('phone'):
-            valores_actualizar['phone'] = celular_formateado
+        telefono_para_guardar = celular_formateado or celular_actual
+        if telefono_para_guardar and telefono_para_guardar != lead.get('phone'):
+            valores_actualizar['phone'] = telefono_para_guardar
 
         if aprobado_final:
-            valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
-            print(f"-> Lead COMPLETO y verificado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
-        else:
-            print("-> Aún falta algún dato. Se guarda lo encontrado y sigue en Prospectos.", flush=True)
-
-        if valores_actualizar:
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
-        
-        mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
-        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
-
-        time.sleep(3)
-
-if __name__ == "__main__":
-    ejecutar_agente()
