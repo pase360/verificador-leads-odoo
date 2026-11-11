@@ -91,7 +91,7 @@ def analizar_lead_con_ia(lead, info_internet):
     """
 
     response = client_ai.models.generate_content(
-        model="gemini-3.8-flash",
+        model="gemini-2.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -102,7 +102,7 @@ def analizar_lead_con_ia(lead, info_internet):
     return response.parsed
 
 def ejecutar_agente():
-    print("Conectando a Odoo...")
+    print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
 
     etapas = models.execute_kw(
@@ -111,11 +111,11 @@ def ejecutar_agente():
     )
     
     if not etapas:
-        print("Error: No se encontró ninguna etapa llamada 'Prospectos'.")
+        print("Error: No se encontró ninguna etapa llamada 'Prospectos'.", flush=True)
         return
 
     id_prospectos = etapas[0]['id']
-    print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})")
+    print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})", flush=True)
 
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'city', 'country_id']
     leads = models.execute_kw(
@@ -123,10 +123,10 @@ def ejecutar_agente():
         [[['stage_id', '=', id_prospectos]]], {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION}
     )
 
-    print(f"Revisando un lote de {len(leads)} leads en Prospectos...")
+    print(f"Revisando un lote de {len(leads)} leads en Prospectos...", flush=True)
 
     for lead in leads:
-        print(f"\n--- Revisando Lead ID {lead['id']}: {lead['name']} ---")
+        print(f"\n--- Revisando Lead ID {lead['id']}: {lead['name']} ---", flush=True)
         ciudad = lead.get('city') or 'Cordoba Argentina'
         termino_busqueda = f"{lead.get('partner_name') or lead.get('name')} {ciudad} whatsapp celular contacto email"
         
@@ -135,12 +135,12 @@ def ejecutar_agente():
         try:
             resultado = analizar_lead_con_ia(lead, info_internet)
         except Exception as e:
-            print(f"Error con Gemini en este lead (se reintentará luego): {e}")
-            time.sleep(10)
+            print(f"Error con Gemini en este lead: {e}", flush=True)
+            time.sleep(5)
             continue
 
         celular_formateado = limpiar_formato_celular(resultado.celular_corregido_o_encontrado)
-        print(f"Resultado IA: Válido={resultado.datos_validos_y_verificados} | Celular={celular_formateado} | Motivo: {resultado.motivo}")
+        print(f"Resultado IA: Válido={resultado.datos_validos_y_verificados} | Celular={celular_formateado} | Motivo: {resultado.motivo}", flush=True)
 
         valores_actualizar = {}
 
@@ -152,9 +152,9 @@ def ejecutar_agente():
 
         if resultado.datos_validos_y_verificados:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
-            print(f"-> Lead aprobado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.")
+            print(f"-> Lead aprobado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
         else:
-            print("-> Lead NO aprobado o incompleto. Se mantiene en Prospectos para seguir chequeando.")
+            print("-> Lead NO aprobado o incompleto. Se mantiene en Prospectos.", flush=True)
 
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
@@ -162,7 +162,7 @@ def ejecutar_agente():
         mensaje_nota = f"<b>Agente de Verificación:</b> {resultado.motivo}"
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
 
-        time.sleep(5)
+        time.sleep(4)
 
 if __name__ == "__main__":
     ejecutar_agente()
