@@ -15,7 +15,7 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 40  # Lote seguro para no exceder límites gratuitos
+MAX_LEADS_POR_EJECUCION = 40  # Lote seguro para cuidar los límites gratuitos
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
