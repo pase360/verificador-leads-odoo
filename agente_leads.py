@@ -61,16 +61,14 @@ def extraer_texto_de_url(url):
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             texto = response.text
-            # Buscar enlaces ocultos de botones de WhatsApp (ej: wa.me/549...)
             whatsapp_links = re.findall(r'(?:wa\.me|api\.whatsapp\.com/send\?phone=)([0-9]+)', texto)
             info_extra = ""
             if whatsapp_links:
                 info_extra = f"\n[ENLACES DE BOTÓN DE WHATSAPP ENCONTRADOS EN LA WEB: {', '.join(whatsapp_links)}]\n"
             
-            # Limpiar etiquetas HTML para quedarse solo con el texto visible
             texto_limpio = re.sub(r'<[^>]+>', ' ', texto)
             texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
-            return f"{info_extra} Contenido de la web: {texto_limpio[:4000]}" # Lee hasta 4000 caracteres de la página
+            return f"{info_extra} Contenido de la web: {texto_limpio[:4000]}"
     except Exception as e:
         return f"[No se pudo acceder a la web: {str(e)}]"
     return ""
@@ -95,7 +93,6 @@ def investigacion_exhaustiva_y_scraping(lead):
     if web_actual.startswith("http"):
         urls_encontradas.append(web_actual)
 
-    # Ronda 1: Búsqueda general
     q1 = f'"{nombre}" {ciudad} contacto whatsapp telefono email'
     resultados1 = ejecutar_consulta_ddgs(q1, max_res=5)
     
@@ -106,18 +103,16 @@ def investigacion_exhaustiva_y_scraping(lead):
         if link.startswith("http") and "instagram" not in link and "facebook" not in link and len(urls_encontradas) < 3:
             urls_encontradas.append(link)
             
-    reporte_total.append(f"=== RESULTADOS DE BÚSQUEDA EN INTERNET ===\n" + "\n".join(snippets))
+    reporte_total.append("=== RESULTADOS DE BÚSQUEDA EN INTERNET ===\n" + "\n".join(snippets))
     time.sleep(1)
 
-    # Ronda 2: Redes Sociales
     q2 = f'"{nombre}" {ciudad} (site:instagram.com OR site:facebook.com)'
     resultados2 = ejecutar_consulta_ddgs(q2, max_res=4)
     if resultados2:
         snippets_redes = [f"- {i.get('title')}: {i.get('body')}" for i in resultados2]
-        reporte_total.append(f"=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n" + "\n".join(snippets_redes))
+        reporte_total.append("=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n" + "\n".join(snippets_redes))
     time.sleep(1)
 
-    # PASO CLAVE: ENTRAR A LAS WEBS ENCONTRADAS Y EXTRAER CONTENIDO INTERNO
     for url in list(set(urls_encontradas)):
         print(f"-> Entrando e investigando la web interna: {url}", flush=True)
         contenido_interno = extraer_texto_de_url(url)
@@ -146,7 +141,7 @@ def analizar_lead_con_ia(lead, info_internet):
     1. TELÉFONOS Y WHATSAPP:
        - Revisa minuciosamente la sección [ENLACES DE BOTÓN DE WHATSAPP ENCONTRADOS EN LA WEB]. Si hay números allí, extrae el número de contacto principal de la entidad.
        - Si el número actual o el encontrado en el texto de la web/redes figura como canal de atención, WhatsApp o contacto directo, ES TOTALMENTE VÁLIDO. No lo descartes por su prefijo.
-       - Devuélvelo en formato numérico limpio (Ej: +5493518738200 o +5493573412724).
+       - Devuélvelo en formato numérico limpio (Ej de salida esperado: +5493518738200 o +5493573412724).
     2. EMAILS:
        - Busca direcciones de correo electrónico corporativas o de Gmail en el contenido interno de las webs analizadas y complétalo.
     3. CONDICIÓN DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
@@ -178,8 +173,8 @@ def ejecutar_agente():
         print("Error: No se encontró ninguna etapa llamada 'Prospectos'.", flush=True)
         return
 
-    id_prospectos = etapas['id']
-    print(f"Etapa encontrada: {etapas['name']} (ID: {id_prospectos})", flush=True)
+    id_prospectos = etapas[0]['id']
+    print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})", flush=True)
 
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'city', 'country_id']
     leads = models.execute_kw(
@@ -230,3 +225,18 @@ def ejecutar_agente():
             valores_actualizar['phone'] = telefono_para_guardar
 
         if aprobado_final:
+            valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
+            print(f"-> Lead COMPLETO y verificado con Scraping. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
+        else:
+            print("-> Datos incompletos tras scraping de webs. Se mantiene en Prospectos.", flush=True)
+
+        if valores_actualizar:
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
+
+        mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
+
+        time.sleep(3)
+
+if __name__ == "__main__":
+    ejecutar_agente()
