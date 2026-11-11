@@ -1,3 +1,3 @@
 google-genai
-duckduckgo-search
+ddgs
 pydantic
