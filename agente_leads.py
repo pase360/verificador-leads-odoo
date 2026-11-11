@@ -91,7 +91,7 @@ def analizar_lead_con_ia(lead, info_internet):
     """
 
     response = client_ai.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
