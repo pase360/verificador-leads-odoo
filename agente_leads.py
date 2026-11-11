@@ -15,7 +15,7 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 40  # Lote seguro para cuidar los límites gratuitos
+MAX_LEADS_POR_EJECUCION = 50  # Lote equilibrado para hacer búsquedas profundas sin saturar
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -45,21 +45,62 @@ def limpiar_formato_celular(numero):
         return f"+549{solo_digitos}"
     return ""
 
-def buscar_en_internet_gratis(query):
+def ejecutar_consulta_ddgs(query, max_res=6):
     try:
-        resultados = DDGS().text(query, region="ar-es", max_results=6)
+        resultados = DDGS().text(query, region="ar-es", max_results=max_res)
         if not resultados:
-            return "Sin resultados de búsqueda."
+            return ""
         snippets = []
         for item in resultados:
-            snippets.append(f"Título: {item.get('title')} | Desc: {item.get('body')} | Link: {item.get('href')}")
+            snippets.append(f"- Título: {item.get('title')} | Desc: {item.get('body')} | Link: {item.get('href')}")
         return "\n".join(snippets)
-    except Exception as e:
-        return f"Error al buscar en internet: {str(e)}"
+    except Exception:
+        return ""
+
+def investigacion_exhaustiva_internet(lead):
+    nombre = lead.get('partner_name') or lead.get('name') or ''
+    ciudad = lead.get('city') or 'Cordoba Argentina'
+    web = lead.get('website') or ''
+    falta_email = not bool(lead.get('email_from'))
+    falta_celular = not bool(limpiar_formato_celular(lead.get('phone')))
+
+    reporte_busquedas = []
+
+    # Ronda 1: Búsqueda general de contacto
+    q1 = f'"{nombre}" {ciudad} contacto whatsapp telefono email'
+    res1 = ejecutar_consulta_ddgs(q1, max_res=6)
+    if res1:
+        reporte_busquedas.append(f"=== BÚSQUEDA GENERAL ===\n{res1}")
+    time.sleep(1.5)
+
+    # Ronda 2: Búsqueda profunda en Redes Sociales (Instagram y Facebook)
+    if falta_email or falta_celular:
+        q2 = f'"{nombre}" {ciudad} (site:instagram.com OR site:facebook.com)'
+        res2 = ejecutar_consulta_ddgs(q2, max_res=6)
+        if res2:
+            reporte_busquedas.append(f"=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n{res2}")
+        time.sleep(1.5)
+
+    # Ronda 3: Búsqueda específica de correo electrónico o sitio web oficial
+    if falta_email:
+        if web:
+            dominio = web.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+            q3 = f'"{dominio}" OR "{nombre}" "@"'
+        else:
+            q3 = f'"{nombre}" {ciudad} ("@gmail.com" OR "@hotmail.com" OR "email" OR "correo")'
+        res3 = ejecutar_consulta_ddgs(q3, max_res=6)
+        if res3:
+            reporte_busquedas.append(f"=== BÚSQUEDA ESPECÍFICA DE EMAIL ===\n{res3}")
+        time.sleep(1.5)
+
+    if not reporte_busquedas:
+        return "No se encontraron resultados tras realizar múltiples búsquedas en web y redes sociales."
+    
+    return "\n\n".join(reporte_busquedas)
 
 def analizar_lead_con_ia(lead, info_internet):
     prompt = f"""
-    Eres un auditor de datos CRM experto en Argentina. Analiza este lead de Odoo y compáralo con los resultados de búsqueda en internet (en Córdoba / Argentina).
+    Eres un investigador de datos CRM experto en Córdoba, Argentina. Tu trabajo es encontrar el EMAIL y el CELULAR faltantes revisando a fondo los resultados de web, Instagram y Facebook.
 
     DATOS ACTUALES EN ODOO:
     - Nombre del Lead: {lead.get('name')}
@@ -69,25 +110,21 @@ def analizar_lead_con_ia(lead, info_internet):
     - Email actual: {lead.get('email_from') or 'VACÍO'}
     - Teléfono actual: {lead.get('phone') or 'VACÍO'}
 
-    RESULTADOS EN INTERNET:
+    RESULTADOS DE INVESTIGACIÓN EXHAUSTIVA:
     {info_internet}
 
-    REGLAS ESTRICTAS DE VALIDACIÓN:
+    REGLAS ESTRICTAS DE EXTRACCIÓN Y VALIDACIÓN:
     1. TELÉFONOS (SOLO CELULARES):
-       - IGNORA Y DESCARTA POR COMPLETO cualquier teléfono fijo (por ejemplo, números de Córdoba que empiezan con 0351 4..., 03573 4..., o números de línea fija sin 15/9). Nunca devuelvas un número fijo.
-       - Busca únicamente teléfonos CELULARES o WhatsApp (números con 15, +54 9, o celulares de Argentina).
-       - Si encuentras un celular o si el teléfono actual es un celular válido, devuélvelo SIEMPRE en el formato exacto sin espacios ni guiones: +549 + código de área sin 0 + número sin 15 (Ejemplo exacto: +5493573412724 o +5493511234567).
-       - Si el teléfono actual en Odoo es un número fijo y no encuentras un celular en internet, devuelve "" en celular_corregido_o_encontrado.
+       - IGNORA Y DESCARTA POR COMPLETO cualquier teléfono fijo (ej. números de Córdoba que empiezan con 0351 4..., 03573 4..., o líneas fijas sin 15/9). Nunca devuelvas un número fijo.
+       - Revisa con lupa las descripciones de Instagram, Facebook y directorios para rescatar cualquier número de WhatsApp o celular (con 15, +54 9, o 351/3573 seguido de 7 dígitos).
+       - Devuélvelo SIEMPRE en el formato exacto sin espacios ni guiones: +549 + código de área sin 0 + número sin 15 (Ejemplo: +5493573412724).
+       - Si el teléfono actual en Odoo es un número fijo y no encontraste un celular en internet, devuelve "".
     2. EMAILS:
-       - Si falta el email, búscalo en los resultados de internet y complétalo. Si no aparece con certeza, déjalo vacío ("").
-       - Si ya tiene email, verifica que pertenezca a esa empresa/persona y corrígelo si hay un error evidente.
-    3. 'datos_validos_y_verificados' debe ser TRUE únicamente si:
-       - Lograste confirmar en internet que los datos presentes (celular y/o email) son reales y correctos.
-       - Si faltaba un dato y no lo encontraste, pero el dato que SÍ tenía (celular válido o email) pudo ser verificado como correcto en internet, también pon TRUE.
-    4. 'datos_validos_y_verificados' debe ser FALSE si:
-       - No pudiste confirmar ninguno de los datos en internet.
-       - Detectaste que el dato cargado es incorrecto o es solo un teléfono fijo sin email válido.
-       - El lead quedó sin email y sin celular.
+       - Revisa cada línea de los resultados (especialmente biografías de Instagram, páginas de Facebook y webs) para rescatar cualquier dirección de correo electrónico perteneciente al comercio o entidad.
+       - Si ya tiene email, verifica que sea real y corrígelo si ves un error evidente. Si no aparece ninguno tras toda la investigación, devuelve "".
+    3. CONDICIÓN OBLIGATORIA PARA APROBAR ('datos_validos_y_verificados' = TRUE):
+       - Debe quedar con AMBOS DATOS COMPLETOS Y VERIFICADOS (Email Y Celular válido).
+       - Si después de investigar sigue faltando el Email o sigue faltando el Celular, pon obligatoriamente FALSE para que permanezca en Prospectos.
     """
 
     response = client_ai.models.generate_content(
@@ -120,17 +157,16 @@ def ejecutar_agente():
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'city', 'country_id']
     leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [[['stage_id', '=', id_prospectos]]], {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION}
+        [[['stage_id', '=', id_prospectos]]],
+        {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'write_date asc'}
     )
 
-    print(f"Revisando un lote de {len(leads)} leads en Prospectos...", flush=True)
+    print(f"Iniciando investigación exhaustiva en un lote de {len(leads)} leads...", flush=True)
 
     for lead in leads:
-        print(f"\n--- Revisando Lead ID {lead['id']}: {lead['name']} ---", flush=True)
-        ciudad = lead.get('city') or 'Cordoba Argentina'
-        termino_busqueda = f"{lead.get('partner_name') or lead.get('name')} {ciudad} whatsapp celular contacto email"
+        print(f"\n--- Investigando a fondo Lead ID {lead['id']}: {lead['name']} ---", flush=True)
         
-        info_internet = buscar_en_internet_gratis(termino_busqueda)
+        info_internet = investigacion_exhaustiva_internet(lead)
         
         try:
             resultado = analizar_lead_con_ia(lead, info_internet)
@@ -140,29 +176,44 @@ def ejecutar_agente():
             continue
 
         celular_formateado = limpiar_formato_celular(resultado.celular_corregido_o_encontrado)
-        print(f"Resultado IA: Válido={resultado.datos_validos_y_verificados} | Celular={celular_formateado} | Motivo: {resultado.motivo}", flush=True)
+        email_final = resultado.email_corregido_o_encontrado.strip()
+
+        email_actual = (lead.get('email_from') or '').strip()
+        celular_actual = limpiar_formato_celular(lead.get('phone'))
+
+        tiene_email = bool(email_actual or email_final)
+        tiene_celular = bool(celular_actual or celular_formateado)
+
+        if not tiene_email or not tiene_celular:
+            aprobado_final = False
+            motivo_ajustado = f"{resultado.motivo} [Sigue en Prospectos: falta {'Email' if not tiene_email else 'Celular'} tras búsqueda profunda]."
+        else:
+            aprobado_final = resultado.datos_validos_y_verificados
+            motivo_ajustado = resultado.motivo
+
+        print(f"Resultado: Aprobado={aprobado_final} | Celular={celular_formateado or celular_actual} | Email={email_final or email_actual} | Motivo: {motivo_ajustado}", flush=True)
 
         valores_actualizar = {}
 
-        if resultado.email_corregido_o_encontrado and resultado.email_corregido_o_encontrado != lead.get('email_from'):
-            valores_actualizar['email_from'] = resultado.email_corregido_o_encontrado
+        if email_final and email_final != email_actual:
+            valores_actualizar['email_from'] = email_final
 
         if celular_formateado and celular_formateado != lead.get('phone'):
             valores_actualizar['phone'] = celular_formateado
 
-        if resultado.datos_validos_y_verificados:
+        if aprobado_final:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
-            print(f"-> Lead aprobado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
+            print(f"-> Lead COMPLETO y verificado. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
         else:
-            print("-> Lead NO aprobado o incompleto. Se mantiene en Prospectos.", flush=True)
+            print("-> Aún falta algún dato. Se guarda lo encontrado y sigue en Prospectos.", flush=True)
 
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
         
-        mensaje_nota = f"<b>Agente de Verificación:</b> {resultado.motivo}"
+        mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
 
-        time.sleep(4)
+        time.sleep(3)
 
 if __name__ == "__main__":
     ejecutar_agente()
