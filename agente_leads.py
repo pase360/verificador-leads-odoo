@@ -21,10 +21,10 @@ MAX_LEADS_POR_EJECUCION = 50  # Lote de control
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
 class ResultadoValidacion(BaseModel):
-    email_corregido_o_encontrado: str
-    celular_corregido_o_encontrado: str
+    email_elegido: str
+    telefono_elegido: str
     coincide_ubicacion_y_rubro: bool
-    es_celular_o_whatsapp_real: bool
+    es_contacto_valido: bool
     datos_validos_y_verificados: bool
     motivo: str
 
@@ -92,7 +92,7 @@ def ejecutar_consulta_ddgs(query, max_res=6):
 def investigacion_exhaustiva_y_scraping(lead):
     nombre = lead.get('partner_name') or lead.get('name') or ''
     direccion = lead.get('street') or ''
-    ciudad = lead.get('city') or 'Cordoba Capital Argentina'
+    ciudad = lead.get('city') or 'Cordoba Argentina'
     web_actual = lead.get('website') or ''
     
     calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
@@ -100,42 +100,46 @@ def investigacion_exhaustiva_y_scraping(lead):
     reporte_total = []
     urls_encontradas = []
     
-    if web_actual.startswith("http"):
+    if web_actual.startswith("http") and "instagram.com" not in web_actual and "facebook.com" not in web_actual:
         urls_encontradas.append(web_actual)
 
-    # Ronda 1: Búsqueda local exacta con dirección y ciudad
-    q1 = f'"{nombre}" "{calle_busqueda}" {ciudad} whatsapp celular contacto email' if calle_busqueda else f'"{nombre}" {ciudad} whatsapp celular contacto email'
-    resultados1 = ejecutar_consulta_ddgs(q1, max_res=5)
+    # Ronda 1: Búsqueda general
+    q1 = f'{nombre} {calle_busqueda} {ciudad} contacto whatsapp telefono email' if calle_busqueda else f'{nombre} {ciudad} contacto whatsapp telefono email'
+    resultados1 = ejecutar_consulta_ddgs(q1, max_res=6)
     
     snippets = []
     for item in resultados1:
         link = item.get('href', '')
         snippets.append(f"- Título: {item.get('title')} | Desc: {item.get('body')} | Link: {link}")
-        if link.startswith("http") and "instagram" not in link and "facebook" not in link and len(urls_encontradas) < 3:
+        if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
             urls_encontradas.append(link)
             
     if snippets:
-        reporte_total.append("=== RESULTADOS DE BÚSQUEDA LOCAL EXACTA ===\n" + "\n".join(snippets))
+        reporte_total.append("=== RESULTADOS DE BÚSQUEDA EN INTERNET ===\n" + "\n".join(snippets))
     time.sleep(1)
 
-    # Ronda 2: Redes Sociales (Instagram y Facebook) para encontrar el WhatsApp móvil publicado en biografías
-    q2 = f'"{nombre}" {ciudad} (site:instagram.com OR site:facebook.com) whatsapp OR celular OR 351'
-    resultados2 = ejecutar_consulta_ddgs(q2, max_res=5)
+    # Ronda 2: Redes Sociales (Instagram y Facebook)
+    q2 = f'{nombre} {ciudad} (site:instagram.com OR site:facebook.com)'
+    resultados2 = ejecutar_consulta_ddgs(q2, max_res=6)
     if resultados2:
         snippets_redes = [f"- {i.get('title')}: {i.get('body')} (Link: {i.get('href')})" for i in resultados2]
         reporte_total.append("=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n" + "\n".join(snippets_redes))
     time.sleep(1)
 
-    # Ronda 3: Búsqueda específica de WhatsApp o celular del comercio en directorios
-    q3 = f'"{nombre}" {calle_busqueda} {ciudad} "whatsapp" OR "cel" OR "móvil"'
-    resultados3 = ejecutar_consulta_ddgs(q3, max_res=4)
+    # Ronda 3: Búsqueda específica de email (@gmail.com, @hotmail.com, correo)
+    q3 = f'{nombre} {ciudad} ("@gmail.com" OR "@hotmail.com" OR "email" OR "correo")'
+    resultados3 = ejecutar_consulta_ddgs(q3, max_res=5)
     if resultados3:
-        snippets_wa = [f"- {i.get('title')}: {i.get('body')}" for i in resultados3]
-        reporte_total.append("=== BÚSQUEDA ESPECÍFICA DE WHATSAPP / CELULAR ===\n" + "\n".join(snippets_wa))
+        snippets_mail = [f"- {i.get('title')}: {i.get('body')} (Link: {i.get('href')})" for i in resultados3]
+        reporte_total.append("=== BÚSQUEDA ESPECÍFICA DE CORREO ELECTRÓNICO ===\n" + "\n".join(snippets_mail))
     time.sleep(1)
 
-    # Ronda 4: Entrar a las webs encontradas y extraer botones de WhatsApp y textos internos
+    # Ronda 4: Entrar a las webs encontradas
     for url in list(set(urls_encontradas)):
+        if "wa.me" in url or "api.whatsapp.com" in url:
+            num_wa = re.sub(r'\D', '', url)
+            reporte_total.append(f"=== ENLACE DIRECTO DE WHATSAPP HALLADO EN BUSCADOR ===\nNúmero WhatsApp: {num_wa}")
+            continue
         print(f"-> Entrando a investigar la web: {url}", flush=True)
         contenido_interno = extraer_texto_de_url(url)
         if contenido_interno:
@@ -146,33 +150,36 @@ def investigacion_exhaustiva_y_scraping(lead):
 
 def analizar_lead_con_ia(lead, info_internet):
     prompt = f"""
-    Eres un auditor de datos CRM ultra estricto en Córdoba Capital, Argentina. Tu trabajo es validar y completar el EMAIL y el WHATSAPP/CELULAR del lead, SIN INVENTAR NINGÚN DATO y SIN CONFUNDIR negocios homónimos.
+    Eres un auditor de datos CRM en Argentina. Tu trabajo es auditar, corregir y completar el EMAIL y el TELÉFONO/WHATSAPP de este lead en Odoo para enviarle una propuesta comercial de alianzas y beneficios (red de descuentos y promociones).
 
-    DATOS ACTUALES EN ODOO:
+    DATOS ACTUALES EN ODOO (PUEDEN TENER ERRORES Y DEBEN SER CORREGIDOS SI LA WEB/RED SOCIAL DICE OTRA COSA):
     - Nombre del Lead: {lead.get('name')}
     - Empresa / Contacto: {lead.get('partner_name') or lead.get('contact_name') or 'No especificado'}
-    - Dirección exacta en Odoo: {lead.get('street') or 'No especificada'}
-    - Ciudad / Provincia: {lead.get('city') or 'Córdoba Capital'}
-    - Email actual: {lead.get('email_from') or 'VACÍO'}
-    - Teléfono actual: {lead.get('phone') or 'VACÍO'}
+    - Dirección en Odoo: {lead.get('street') or 'No especificada'}
+    - Ciudad / Provincia: {lead.get('city') or 'Córdoba'}
+    - Email actual en Odoo: {lead.get('email_from') or 'VACÍO'}
+    - Teléfono actual en Odoo: {lead.get('phone') or 'VACÍO'}
 
-    RESULTADOS DE INVESTIGACIÓN Y SCRAPING INTERNO DE WEBS:
+    RESULTADOS DE INVESTIGACIÓN EN WEB Y REDES SOCIALES:
     {info_internet}
 
-    REGLAS ESTRICTAS DE VALIDACIÓN (PROHIBIDO INVENTAR O ADIVINAR):
+    REGLAS ESTRICTAS DE AUDITORÍA, CORRECCIÓN Y SELECCIÓN:
     1. CERO INVENCIÓN DE DATOS:
-       - Nunca inventes, supongas ni construyas un email o teléfono que no esté escrito explícitamente en los resultados de internet de ese comercio exacto.
-       - Si un dato no aparece literal y comprobado en internet para esa dirección/comercio, deja el campo vacío ("").
-    2. CONTROL ANTI-HOMÓNIMOS Y DIRECCIÓN:
-       - Verifica que la web, Instagram o directorio pertenezca exactamente al negocio ubicado en la dirección de Odoo ({lead.get('street') or 'Córdoba'}).
-       - Si pertenece a otro negocio con el mismo nombre en otra calle o provincia, pon 'coincide_ubicacion_y_rubro' = FALSE y descarta todos sus datos.
-    3. DISTINCIÓN ENTRE TELÉFONO FIJO Y WHATSAPP / CELULAR:
-       - En Córdoba, los números fijos tradicionales empiezan con 42..., 43..., 45..., 47..., 48..., 727... (por ejemplo 351 7272922 o 351 4823645 son LÍNEAS FIJAS).
-       - NO apruebes una línea fija tradicional como si fuera WhatsApp, A MENOS QUE en la web o redes aparezca explícitamente dentro de un botón de WhatsApp ([BOTÓN DE WHATSAPP DETECTADO]) o indicado textualmente como "WhatsApp".
-       - Si en Odoo hay cargado un teléfono fijo (ej. +5493517272922) y en internet o redes (como Instagram/Facebook) encuentras el verdadero celular móvil del negocio (ej. 351 2099608), REEMPLAZA el fijo por ese celular móvil (+5493512099608) y pon 'es_celular_o_whatsapp_real' = TRUE.
-       - Si solo existe un teléfono fijo tradicional y no encontraste su número de WhatsApp/celular, pon 'es_celular_o_whatsapp_real' = FALSE y devuelve "" en celular_corregido_o_encontrado.
-    4. CONDICIÓN DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
-       - Pon TRUE únicamente si 'coincide_ubicacion_y_rubro' = TRUE, 'es_celular_o_whatsapp_real' = TRUE, y el lead tiene tanto EMAIL como WHATSAPP/CELULAR verificados de forma literal en internet.
+       - Nunca inventes ni supongas un email o teléfono que no esté escrito literalmente en los resultados.
+    2. CONTROL DE UBICACIÓN Y RUBRO:
+       - Si el resultado encontrado está en la misma ciudad/localidad (ej. Córdoba, Villa Carlos Paz) y corresponde al mismo negocio y rubro, pon 'coincide_ubicacion_y_rubro' = TRUE.
+       - Pon FALSE únicamente si es otro rubro o está en otra provincia distinta.
+    3. REGLA DE TELÉFONO Y SELECCIÓN SI HAY VARIOS (LA WEB/RED SOCIAL MANDA SOBRE ODOO):
+       - Compara el teléfono publicado en la red social (Facebook/Instagram) o página web oficial del negocio con el teléfono actual de Odoo.
+       - SI NO COINCIDEN (por ejemplo, Odoo tiene +5493518502550 pero el Facebook oficial del local publica 0351 659-1654), EL DE LA RED SOCIAL O WEB OFICIAL ES EL CORRECTO Y DEBES DEVOLVER ESE EN 'telefono_elegido' PARA SOBRESCRIBIR Y CORREGIR ODOO.
+       - Si la web o red social publica MÁS DE UN teléfono: prioriza SIEMPRE el que diga "WhatsApp", tenga el ícono o botón de WhatsApp ([BOTÓN DE WHATSAPP DETECTADO]), o sea un celular móvil por encima de una línea fija. Si solo tiene un número oficial publicado en su red social/web (como contacto principal), úsalo normalizado con +549 adelante.
+       - Si en internet no aparece ningún teléfono publicado para ese comercio pero en Odoo ya hay uno cargado, devuelve el de Odoo normalizado.
+    4. REGLA DE EMAIL Y SELECCIÓN SI HAY VARIOS (IDEAL PARA PROPUESTAS COMERCIALES):
+       - Si la web o red social publica MÁS DE UN correo electrónico (ej. compras@, rrhh@, proveedores@, ventas@, info@, contacto@, administracion@), elige SIEMPRE el más adecuado para recibir una propuesta comercial, alianza o adhesión a una red de beneficios (prioriza en este orden: comercial@, marketing@, alianzas@, contacto@, info@, administracion@, gerencia@, o el correo general del negocio como gmail/hotmail). Descarta correos exclusivos de soporte técnico, facturas o currículums (rrhh@).
+       - Si el email de Odoo no coincide con el de la web/red social oficial, reemplázalo por el oficial.
+    5. CONDICIÓN DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
+       - Pon TRUE únicamente si 'coincide_ubicacion_y_rubro' = TRUE y el lead queda con AMBOS DATOS (Email válido Y Teléfono de contacto/WhatsApp) confirmados y corregidos.
+       - Si tras investigar sigue faltando el Email o sigue faltando el Teléfono, pon FALSE para que se guarde el avance pero permanezca en Prospectos.
     """
 
     response = client_ai.models.generate_content(
@@ -209,10 +216,10 @@ def ejecutar_agente():
         {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'write_date asc'}
     )
 
-    print(f"Iniciando investigación con tolerancia cero a datos inventados o fijos en {len(leads)} leads...", flush=True)
+    print(f"Iniciando auditoría y corrección inteligente en {len(leads)} leads...", flush=True)
 
     for lead in leads:
-        print(f"\n--- Investigando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
+        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         
         info_internet = investigacion_exhaustiva_y_scraping(lead)
         
@@ -223,36 +230,44 @@ def ejecutar_agente():
             time.sleep(5)
             continue
 
-        celular_formateado = limpiar_formato_celular(resultado.celular_corregido_o_encontrado)
-        email_final = resultado.email_corregido_o_encontrado.strip()
+        telefono_formateado = limpiar_formato_celular(resultado.telefono_elegido)
+        email_final = resultado.email_elegido.strip().lower()
 
-        email_actual = (lead.get('email_from') or '').strip()
-        tiene_email = bool(email_actual or email_final)
-        tiene_whatsapp_valido = resultado.es_celular_o_whatsapp_real and bool(celular_formateado)
+        email_actual = (lead.get('email_from') or '').strip().lower()
+        telefono_actual = limpiar_formato_celular(lead.get('phone'))
 
-        if not resultado.coincide_ubicacion_y_rubro or not tiene_email or not tiene_whatsapp_valido:
+        email_definitivo = email_final if email_final else email_actual
+        telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
+
+        tiene_email = bool(email_definitivo)
+        tiene_telefono = bool(telefono_definitivo) and resultado.es_contacto_valido
+
+        if not resultado.coincide_ubicacion_y_rubro or not tiene_email or not tiene_telefono:
             aprobado_final = False
-            motivo_ajustado = f"{resultado.motivo} [Mantenido en Prospectos: falta WhatsApp móvil real, email o confirmación de dirección]."
+            motivo_ajustado = f"{resultado.motivo} [Mantenido en Prospectos: falta {'Email' if not tiene_email else 'Teléfono'} o confirmación]."
         else:
             aprobado_final = resultado.datos_validos_y_verificados
             motivo_ajustado = resultado.motivo
 
-        print(f"Resultado: Aprobado={aprobado_final} | CoincideDir={resultado.coincide_ubicacion_y_rubro} | EsWhatsApp={resultado.es_celular_o_whatsapp_real} | Tel={celular_formateado} | Email={email_final or email_actual}", flush=True)
+        print(f"Resultado: Aprobado={aprobado_final} | CoincideDir={resultado.coincide_ubicacion_y_rubro} | Tel={telefono_definitivo} | Email={email_definitivo}", flush=True)
 
         valores_actualizar = {}
 
+        # Sobrescribir email en Odoo si el de la web/red social es distinto o completa uno vacío
         if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual:
             valores_actualizar['email_from'] = email_final
+            print(f"-> Corrigiendo/Completando Email en Odoo: {email_actual or 'VACÍO'} => {email_final}", flush=True)
 
-        # Si encontró un WhatsApp móvil real, reemplaza incluso si antes había un teléfono fijo cargado
-        if resultado.coincide_ubicacion_y_rubro and resultado.es_celular_o_whatsapp_real and celular_formateado and celular_formateado != lead.get('phone'):
-            valores_actualizar['phone'] = celular_formateado
+        # Sobrescribir teléfono en Odoo si el de la web/red social no coincide con el guardado
+        if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != lead.get('phone'):
+            valores_actualizar['phone'] = telefono_formateado
+            print(f"-> Corrigiendo/Completando Teléfono en Odoo: {lead.get('phone') or 'VACÍO'} => {telefono_formateado}", flush=True)
 
         if aprobado_final:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
-            print(f"-> Lead COMPLETO y verificado con WhatsApp real. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
+            print(f"-> Lead COMPLETO y corregido. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
         else:
-            print("-> No se aprobó (solo se halló fijo, falta dato o no coincide dirección). Sigue en Prospectos.", flush=True)
+            print("-> Avance guardado (si halló datos). Sigue en Prospectos hasta completar ambos.", flush=True)
 
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
