@@ -34,6 +34,28 @@ def conectar_odoo():
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
 
+def limpiar_nombre_busqueda(nombre_raw):
+    """Genera variantes limpias del nombre quitando palabras de rubro genéricas para coincidir con redes sociales"""
+    if not nombre_raw:
+        return "", ""
+    # Quitar textos entre paréntesis o después de guiones largos
+    base = re.split(r'[\(\|\–-]', nombre_raw)[0].strip()
+    
+    # Palabras de rubro que los dueños suelen omitir en el nombre de su Facebook/Instagram
+    rubros = [
+        r'\bdiet[eé]tica\b', r'\bverduleria\b', r'\bverduler[ií]a\b', r'\bferreteria\b',
+        r'\bferreter[ií]a\b', r'\bfloreria\b', r'\bflorer[ií]a\b', r'\bpintureria\b',
+        r'\bpinturer[ií]a\b', r'\bfarmacia\b', r'\bcotillon\b', r'\bcotill[oó]n\b',
+        r'\bautolavadero\b', r'\bhelados\b', r'\bheladeria\b', r'\bhelader[ií]a\b',
+        r'\btienda\b', r'\balmacen\b', r'\balmac[eé]n\b', r'\bpanaderia\b', r'\bpanader[ií]a\b'
+    ]
+    corto = base
+    for r in rubros:
+        corto = re.sub(r, '', corto, flags=re.IGNORECASE).strip()
+    corto = re.sub(r'\s+', ' ', corto).strip()
+    
+    return base, (corto if len(corto) >= 3 else base)
+
 def limpiar_formato_celular(numero):
     if not numero:
         return ""
@@ -90,9 +112,11 @@ def ejecutar_consulta_ddgs(query, max_res=6):
         return []
 
 def investigacion_exhaustiva_y_scraping(lead):
-    nombre = lead.get('partner_name') or lead.get('name') or ''
+    nombre_raw = lead.get('partner_name') or lead.get('name') or ''
+    nombre_completo, nombre_corto = limpiar_nombre_busqueda(nombre_raw)
+    
     direccion = lead.get('street') or ''
-    ciudad = lead.get('city') or 'Cordoba Argentina'
+    ciudad = lead.get('city') or 'Cordoba'
     web_actual = lead.get('website') or ''
     
     calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
@@ -103,38 +127,43 @@ def investigacion_exhaustiva_y_scraping(lead):
     if web_actual.startswith("http") and "instagram.com" not in web_actual and "facebook.com" not in web_actual:
         urls_encontradas.append(web_actual)
 
-    # Ronda 1: Búsqueda general
-    q1 = f'{nombre} {calle_busqueda} {ciudad} contacto whatsapp telefono email' if calle_busqueda else f'{nombre} {ciudad} contacto whatsapp telefono email'
+    # Ronda 1: Búsqueda general con nombre limpio y calle/ciudad
+    q1 = f'{nombre_completo} {calle_busqueda} {ciudad} contacto telefono email' if calle_busqueda else f'{nombre_completo} {ciudad} contacto whatsapp telefono email'
     resultados1 = ejecutar_consulta_ddgs(q1, max_res=6)
     
     snippets = []
     for item in resultados1:
         link = item.get('href', '')
         snippets.append(f"- Título: {item.get('title')} | Desc: {item.get('body')} | Link: {link}")
-        if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
+        if link.startswith("http") and "instagram" not in link and "facebook" not in link and len(urls_encontradas) < 3:
             urls_encontradas.append(link)
             
     if snippets:
-        reporte_total.append("=== RESULTADOS DE BÚSQUEDA EN INTERNET ===\n" + "\n".join(snippets))
+        reporte_total.append("=== RESULTADOS DE BÚSQUEDA GENERAL ===\n" + "\n".join(snippets))
     time.sleep(1)
 
-    # Ronda 2: Redes Sociales (Instagram y Facebook)
-    q2 = f'{nombre} {ciudad} (site:instagram.com OR site:facebook.com)'
+    # Ronda 2: Redes Sociales usando el NOMBRE CORTO (sin la palabra Dietética/Verdulería/etc.) + calle o ciudad
+    q2 = f'"{nombre_corto}" {ciudad} {calle_busqueda} (site:facebook.com OR site:instagram.com)'
     resultados2 = ejecutar_consulta_ddgs(q2, max_res=6)
+    if not resultados2 and calle_busqueda:
+        # Si con calle no trajo nada, buscar solo nombre corto + ciudad en Facebook/Instagram
+        q2_alt = f'"{nombre_corto}" {ciudad} (site:facebook.com OR site:instagram.com)'
+        resultados2 = ejecutar_consulta_ddgs(q2_alt, max_res=6)
+        
     if resultados2:
-        snippets_redes = [f"- {i.get('title')}: {i.get('body')} (Link: {i.get('href')})" for i in resultados2]
-        reporte_total.append("=== REDES SOCIALES (INSTAGRAM / FACEBOOK) ===\n" + "\n".join(snippets_redes))
+        snippets_redes = [f"- Título: {i.get('title')} | Desc: {i.get('body')} | Link: {i.get('href')}" for i in resultados2]
+        reporte_total.append("=== REDES SOCIALES (FACEBOOK / INSTAGRAM) ===\n" + "\n".join(snippets_redes))
     time.sleep(1)
 
-    # Ronda 3: Búsqueda específica de email (@gmail.com, @hotmail.com, correo)
-    q3 = f'{nombre} {ciudad} ("@gmail.com" OR "@hotmail.com" OR "email" OR "correo")'
-    resultados3 = ejecutar_consulta_ddgs(q3, max_res=5)
+    # Ronda 3: Búsqueda específica por dirección exacta y nombre corto para rescatar emails (@gmail.com)
+    q3 = f'"{nombre_corto}" "{calle_busqueda}" {ciudad}' if calle_busqueda else f'"{nombre_corto}" {ciudad} "@gmail.com"'
+    resultados3 = ejecutar_consulta_ddgs(q3, max_res=6)
     if resultados3:
-        snippets_mail = [f"- {i.get('title')}: {i.get('body')} (Link: {i.get('href')})" for i in resultados3]
-        reporte_total.append("=== BÚSQUEDA ESPECÍFICA DE CORREO ELECTRÓNICO ===\n" + "\n".join(snippets_mail))
+        snippets_dir = [f"- Título: {i.get('title')} | Desc: {i.get('body')} | Link: {i.get('href')}" for i in resultados3]
+        reporte_total.append("=== BÚSQUEDA POR DIRECCIÓN Y CORREOS ===\n" + "\n".join(snippets_dir))
     time.sleep(1)
 
-    # Ronda 4: Entrar a las webs encontradas
+    # Ronda 4: Entrar a las webs encontradas (descartando redes sociales que bloquean scraping)
     for url in list(set(urls_encontradas)):
         if "wa.me" in url or "api.whatsapp.com" in url:
             num_wa = re.sub(r'\D', '', url)
@@ -150,13 +179,14 @@ def investigacion_exhaustiva_y_scraping(lead):
 
 def analizar_lead_con_ia(lead, info_internet):
     prompt = f"""
-    Eres un auditor de datos CRM en Argentina. Tu trabajo es auditar, corregir y completar el EMAIL y el TELÉFONO/WHATSAPP de este lead en Odoo para enviarle una propuesta comercial de alianzas y beneficios (red de descuentos y promociones).
+    Eres un auditor de datos CRM en Argentina. Tu trabajo es auditar, corregir y completar el EMAIL y el TELÉFONO/WHATSAPP de este lead en Odoo para enviarle una propuesta comercial de alianzas y beneficios.
 
     DATOS ACTUALES EN ODOO (PUEDEN TENER ERRORES Y DEBEN SER CORREGIDOS SI LA WEB/RED SOCIAL DICE OTRA COSA):
     - Nombre del Lead: {lead.get('name')}
     - Empresa / Contacto: {lead.get('partner_name') or lead.get('contact_name') or 'No especificado'}
     - Dirección en Odoo: {lead.get('street') or 'No especificada'}
     - Ciudad / Provincia: {lead.get('city') or 'Córdoba'}
+    - Web en Odoo: {lead.get('website') or 'No especificada'}
     - Email actual en Odoo: {lead.get('email_from') or 'VACÍO'}
     - Teléfono actual en Odoo: {lead.get('phone') or 'VACÍO'}
 
@@ -166,20 +196,20 @@ def analizar_lead_con_ia(lead, info_internet):
     REGLAS ESTRICTAS DE AUDITORÍA, CORRECCIÓN Y SELECCIÓN:
     1. CERO INVENCIÓN DE DATOS:
        - Nunca inventes ni supongas un email o teléfono que no esté escrito literalmente en los resultados.
-    2. CONTROL DE UBICACIÓN Y RUBRO:
-       - Si el resultado encontrado está en la misma ciudad/localidad (ej. Córdoba, Villa Carlos Paz) y corresponde al mismo negocio y rubro, pon 'coincide_ubicacion_y_rubro' = TRUE.
-       - Pon FALSE únicamente si es otro rubro o está en otra provincia distinta.
-    3. REGLA DE TELÉFONO Y SELECCIÓN SI HAY VARIOS (LA WEB/RED SOCIAL MANDA SOBRE ODOO):
-       - Compara el teléfono publicado en la red social (Facebook/Instagram) o página web oficial del negocio con el teléfono actual de Odoo.
-       - SI NO COINCIDEN (por ejemplo, Odoo tiene +5493518502550 pero el Facebook oficial del local publica 0351 659-1654), EL DE LA RED SOCIAL O WEB OFICIAL ES EL CORRECTO Y DEBES DEVOLVER ESE EN 'telefono_elegido' PARA SOBRESCRIBIR Y CORREGIR ODOO.
-       - Si la web o red social publica MÁS DE UN teléfono: prioriza SIEMPRE el que diga "WhatsApp", tenga el ícono o botón de WhatsApp ([BOTÓN DE WHATSAPP DETECTADO]), o sea un celular móvil por encima de una línea fija. Si solo tiene un número oficial publicado en su red social/web (como contacto principal), úsalo normalizado con +549 adelante.
-       - Si en internet no aparece ningún teléfono publicado para ese comercio pero en Odoo ya hay uno cargado, devuelve el de Odoo normalizado.
-    4. REGLA DE EMAIL Y SELECCIÓN SI HAY VARIOS (IDEAL PARA PROPUESTAS COMERCIALES):
-       - Si la web o red social publica MÁS DE UN correo electrónico (ej. compras@, rrhh@, proveedores@, ventas@, info@, contacto@, administracion@), elige SIEMPRE el más adecuado para recibir una propuesta comercial, alianza o adhesión a una red de beneficios (prioriza en este orden: comercial@, marketing@, alianzas@, contacto@, info@, administracion@, gerencia@, o el correo general del negocio como gmail/hotmail). Descarta correos exclusivos de soporte técnico, facturas o currículums (rrhh@).
-       - Si el email de Odoo no coincide con el de la web/red social oficial, reemplázalo por el oficial.
+    2. COINCIDENCIA DE NOMBRE Y DIRECCIÓN:
+       - Ten en cuenta que en Facebook/Instagram los comercios suelen llamarse sin el rubro (ej. en Odoo dice "Dietética Rincón Bonito" en "Av. Ricardo Rojas 9113" y en Facebook aparece como "Rincón Bonito" en "Av Ricardo Rojas 9113, Córdoba"). Si coincide la dirección o el rubro en la misma ciudad, es el MISMO negocio ('coincide_ubicacion_y_rubro' = TRUE).
+       - Pon FALSE únicamente si es otro rubro distinto o está en otra provincia.
+    3. REGLA DE TELÉFONO Y CORRECCIÓN (LA RED SOCIAL / WEB MANDA SOBRE ODOO):
+       - Compara el teléfono publicado en Facebook, Instagram o web oficial del negocio con el teléfono actual de Odoo.
+       - SI NO COINCIDEN (por ejemplo, Odoo tiene +5493518502550 pero el Facebook oficial del local en Av. Ricardo Rojas 9113 publica 0351 659-1654), EL DE LA RED SOCIAL O WEB OFICIAL ES EL CORRECTO Y DEBES DEVOLVER ESE EN 'telefono_elegido' (+5493516591654) PARA CORREGIR ODOO.
+       - Si la web o red social publica MÁS DE UN teléfono: prioriza SIEMPRE el que diga "WhatsApp", tenga botón de WhatsApp ([BOTÓN DE WHATSAPP DETECTADO]), o sea un celular móvil por encima de una línea fija. Si solo tiene un número oficial publicado en su red social/web, úsalo normalizado con +549 adelante.
+       - Si en internet no aparece ningún teléfono publicado pero en Odoo ya hay uno cargado y el comercio existe, devuelve el de Odoo normalizado.
+    4. REGLA DE EMAIL Y SELECCIÓN SI HAY VARIOS:
+       - Extrae el correo electrónico publicado en Facebook, Instagram o web (por ejemplo rinconbonitodiet@gmail.com).
+       - Si hay más de un correo, elige el más adecuado para recibir una propuesta comercial o alianza (comercial@, marketing@, contacto@, info@, administracion@ o el correo principal del comercio), descartando soporte técnico o rrhh@.
     5. CONDICIÓN DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
        - Pon TRUE únicamente si 'coincide_ubicacion_y_rubro' = TRUE y el lead queda con AMBOS DATOS (Email válido Y Teléfono de contacto/WhatsApp) confirmados y corregidos.
-       - Si tras investigar sigue faltando el Email o sigue faltando el Teléfono, pon FALSE para que se guarde el avance pero permanezca en Prospectos.
+       - Si tras investigar sigue faltando el Email o sigue faltando el Teléfono, pon FALSE para guardar el avance parcial pero mantenerlo en Prospectos.
     """
 
     response = client_ai.models.generate_content(
@@ -216,7 +246,7 @@ def ejecutar_agente():
         {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'write_date asc'}
     )
 
-    print(f"Iniciando auditoría y corrección inteligente en {len(leads)} leads...", flush=True)
+    print(f"Iniciando auditoría con búsqueda inteligente de nombres cortos en {len(leads)} leads...", flush=True)
 
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
@@ -253,12 +283,10 @@ def ejecutar_agente():
 
         valores_actualizar = {}
 
-        # Sobrescribir email en Odoo si el de la web/red social es distinto o completa uno vacío
         if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual:
             valores_actualizar['email_from'] = email_final
             print(f"-> Corrigiendo/Completando Email en Odoo: {email_actual or 'VACÍO'} => {email_final}", flush=True)
 
-        # Sobrescribir teléfono en Odoo si el de la web/red social no coincide con el guardado
         if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != lead.get('phone'):
             valores_actualizar['phone'] = telefono_formateado
             print(f"-> Corrigiendo/Completando Teléfono en Odoo: {lead.get('phone') or 'VACÍO'} => {telefono_formateado}", flush=True)
