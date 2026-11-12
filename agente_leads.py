@@ -16,7 +16,7 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 100  # Lote de control
+MAX_LEADS_POR_EJECUCION = 50  # Lote de control
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -72,7 +72,7 @@ def extraer_texto_de_url(url):
         return ""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept-Language': 'es-AR,es;q=0.9'
         }
         response = requests.get(url, headers=headers, timeout=12)
@@ -81,7 +81,7 @@ def extraer_texto_de_url(url):
             whatsapp_links = re.findall(r'(?:wa\.me/|whatsapp\.com/send\?phone=|whatsapp://send\?phone=)([0-9+\s-]+)', texto, re.IGNORECASE)
             whatsapp_limpios = [re.sub(r'\D', '', w) for w in whatsapp_links if len(re.sub(r'\D', '', w)) >= 8]
             emails_html = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', texto)
-            emails_filtrados = list(set([e.lower() for e in emails_html if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', 'sentry.io', 'wixpress.com'))]))
+            emails_filtrados = list(set([e.lower() for e in emails_html if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', 'sentry.io', 'wixpress.com', 'example.com'))]))
             
             info_extra = ""
             if whatsapp_limpios:
@@ -115,7 +115,6 @@ def investigacion_profunda_con_google_search(lead):
     reporte_total = []
     urls_encontradas = []
 
-    # 1. Búsqueda general con nombre original y calle
     q1 = f'{nombre_original} {calle_busqueda} {ciudad} contacto whatsapp email'
     print(f"-> Buscando en web: {q1}", flush=True)
     res1 = ejecutar_consulta_ddgs(q1, max_res=6)
@@ -129,22 +128,14 @@ def investigacion_profunda_con_google_search(lead):
         reporte_total.append("=== BÚSQUEDA WEB GENERAL ===\n" + "\n".join(snippets1))
     time.sleep(1)
 
-    # 2. Búsqueda específica en Facebook e Instagram con nombre corto + calle
     q2 = f'"{nombre_corto}" {calle_busqueda} {ciudad} (site:facebook.com OR site:instagram.com)' if calle_busqueda else f'"{nombre_corto}" {ciudad} (site:facebook.com OR site:instagram.com)'
     print(f"-> Buscando en Facebook/Instagram: {q2}", flush=True)
     res2 = ejecutar_consulta_ddgs(q2, max_res=6)
     if res2:
         snippets2 = [f"- {i.get('title')} | {i.get('body')} | {i.get('href')}" for i in res2]
         reporte_total.append("=== RESULTADOS DE FACEBOOK E INSTAGRAM ===\n" + "\n".join(snippets2))
-        for i in res2:
-            link_fb = i.get('href', '')
-            if "facebook.com" in link_fb:
-                contenido_fb = extraer_texto_de_url(link_fb)
-                if contenido_fb and ("@" in contenido_fb or "659" in contenido_fb or "Información" in contenido_fb):
-                    reporte_total.append(f"=== CONTENIDO EXTRAÍDO DE FACEBOOK ({link_fb}) ===\n{contenido_fb}")
     time.sleep(1)
 
-    # 3. Búsqueda directa de correos (@gmail.com / @hotmail.com) con nombre corto y calle
     q3 = f'"{nombre_corto}" {calle_busqueda} ("@gmail.com" OR "@hotmail.com" OR "@yahoo.com")'
     print(f"-> Rastreando correos electrónicos: {q3}", flush=True)
     res3 = ejecutar_consulta_ddgs(q3, max_res=5)
@@ -153,7 +144,6 @@ def investigacion_profunda_con_google_search(lead):
         reporte_total.append("=== RASTREO DE EMAILS ===\n" + "\n".join(snippets3))
     time.sleep(1)
 
-    # 4. Scraping de webs oficiales encontradas
     for url in list(set(urls_encontradas)):
         if "wa.me" in url or "api.whatsapp.com" in url:
             num_wa = re.sub(r'\D', '', url)
@@ -190,7 +180,7 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     INSTRUCCIONES OBLIGATORIAS DE BÚSQUEDA Y VALIDACIÓN:
     1. USA GOOGLE SEARCH AHORA MISMO:
        - Busca en Google: "{nombre_corto}" "{direccion.split(',')[0]}" {ciudad} facebook OR instagram OR email OR telefono
-       - En Facebook (por ejemplo páginas como Rincón Bonito en Av Ricardo Rojas 9113), revisa la sección "Información de contacto" donde figura su teléfono (ej. 0351 659-1654) y su correo (ej. rinconbonitodiet@gmail.com).
+       - Revisa las fichas públicas de Google Maps, Facebook, Instagram y directorios para obtener el teléfono y el correo electrónico real del comercio.
     2. CORRECCIÓN DE TELÉFONO Y SELECCIÓN SI HAY VARIOS:
        - Si el teléfono publicado en la página oficial de Facebook, Instagram o web del comercio NO coincide con el teléfono de Odoo, EL DE LA WEB/RED SOCIAL ES EL CORRECTO y debes devolverlo en 'telefono_elegido' (normalizado con +549 adelante, ej. +5493516591654) para sobrescribir Odoo.
        - Si hay más de un teléfono, prioriza siempre el que indique WhatsApp o sea móvil.
@@ -202,12 +192,26 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
        - Pon FALSE únicamente si no pudiste confirmar ni el teléfono ni el email en internet, o si el negocio pertenece a otra provincia/rubro distinto.
     """
 
-    # Usamos Gemini con Google Search Grounding activado (gratis en Gemini API)
-    response = client_ai.models.generate_content(
-        model="gemini-2.5-flash",
+    # Paso 1: Ejecutar Google Search Grounding (sin response_mime_type JSON para evitar error 400 de la API)
+    busqueda_google = client_ai.models.generate_content(
+        model="gemini-3.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[{"google_search": {}}],
+            temperature=0.0,
+        ),
+    )
+    hallazgos_google = busqueda_google.text or "Sin hallazgos adicionales en Google."
+
+    # Paso 2: Estructurar la respuesta en el formato exacto de Odoo
+    prompt_estructurado = f"""
+    Con base en los hallazgos obtenidos, extrae los campos finales en JSON estricto:
+    {hallazgos_google}
+    """
+    response = client_ai.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt_estructurado,
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ResultadoValidacion,
             temperature=0.0,
@@ -235,7 +239,7 @@ def ejecutar_agente():
     leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
         [[['stage_id', '=', id_prospectos]]],
-        {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'write_date asc'}
+        {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'id desc'}
     )
 
     print(f"Iniciando investigación con Google Search + Facebook en {len(leads)} leads...", flush=True)
