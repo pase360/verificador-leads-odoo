@@ -3,6 +3,7 @@ import re
 import time
 import xmlrpc.client
 import requests
+from datetime import datetime, timedelta, timezone
 from ddgs import DDGS
 from google import genai
 from google.genai import types
@@ -16,16 +17,34 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 50  # Lote de control
+LEADS_NUEVOS_POR_EJECUCION = 50
+LEADS_ATRASADOS_POR_EJECUCION = 150
+INTERVALO_GEMINI_SEGUNDOS = 4.2
+MODELO_GEMINI = "gemini-3.1-flash-lite"
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
 class ResultadoValidacion(BaseModel):
     email_elegido: str
     telefono_elegido: str
+    email_verificado: bool
+    telefono_verificado: bool
     coincide_ubicacion_y_rubro: bool
     datos_validos_y_verificados: bool
     motivo: str
+
+class CuotaGeminiAgotada(Exception):
+    pass
+
+def generar_con_gemini(**kwargs):
+    time.sleep(INTERVALO_GEMINI_SEGUNDOS)
+    try:
+        return client_ai.models.generate_content(**kwargs)
+    except Exception as exc:
+        mensaje = str(exc).lower()
+        if "429" in mensaje or "resource_exhausted" in mensaje or "quota" in mensaje or "rate limit" in mensaje:
+            raise CuotaGeminiAgotada(str(exc)) from exc
+        raise
 
 def conectar_odoo():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
@@ -187,14 +206,18 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     3. SELECCIÓN DE EMAIL Y CERO INVENCIÓN:
        - Extrae únicamente correos que existan literalmente en Google, Facebook, Instagram o la web del comercio. Nunca inventes correos.
        - Si hay varios correos, elige el más adecuado para propuestas comerciales o alianzas (comercial@, marketing@, contacto@, info@, administracion@ o el correo principal del comercio).
-    4. REGLA DE APROBACIÓN ('datos_validos_y_verificados' = TRUE):
-       - Pon TRUE si el comercio coincide en ubicación/rubro y logras tener AL MENOS UN CANAL DE CONTACTO CONFIRMADO (Email verificado O Teléfono/WhatsApp verificado en internet), completando ambos siempre que existan en Google/Facebook/Web.
-       - Pon FALSE únicamente si no pudiste confirmar ni el teléfono ni el email en internet, o si el negocio pertenece a otra provincia/rubro distinto.
+    4. REGLA DE APROBACIÓN:
+       - Devuelve email_verificado=TRUE solo si el correo elegido aparece literalmente en una fuente pública confiable y pertenece a este comercio/sucursal.
+       - Devuelve telefono_verificado=TRUE solo si el teléfono elegido aparece en una fuente pública confiable y pertenece a este comercio/sucursal.
+       - Para aprobar, ambos canales deben estar presentes y verificados. Si falta uno, buscá más; si no aparece, devolvé FALSE.
+       - Si un dato actual de Odoo es incorrecto, reemplazalo solo con el dato correcto respaldado por evidencia.
+       - datos_validos_y_verificados=TRUE únicamente si coinciden comercio, ubicación y rubro, y email_verificado y telefono_verificado son TRUE.
+       - Nunca marques como verificado un dato solo porque ya estaba cargado en Odoo.
     """
 
     # Paso 1: Ejecutar Google Search Grounding (sin response_mime_type JSON para evitar error 400 de la API)
-    busqueda_google = client_ai.models.generate_content(
-        model="gemini-3.5-flash-lite",
+    busqueda_google = generar_con_gemini(
+        model=MODELO_GEMINI,
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[{"google_search": {}}],
@@ -208,8 +231,8 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     Con base en los hallazgos obtenidos, extrae los campos finales en JSON estricto:
     {hallazgos_google}
     """
-    response = client_ai.models.generate_content(
-        model="gemini-3.5-flash-lite",
+    response = generar_con_gemini(
+        model=MODELO_GEMINI,
         contents=prompt_estructurado,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -227,7 +250,7 @@ def ejecutar_agente():
         ODOO_DB, uid, ODOO_API_KEY, 'crm.stage', 'search_read',
         [[['name', 'ilike', 'Prospectos']]], {'fields': ['id', 'name'], 'limit': 1}
     )
-    
+
     if not etapas:
         print("Error: No se encontró ninguna etapa llamada 'Prospectos'.", flush=True)
         return
@@ -235,63 +258,98 @@ def ejecutar_agente():
     id_prospectos = etapas[0]['id']
     print(f"Etapa encontrada: {etapas[0]['name']} (ID: {id_prospectos})", flush=True)
 
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'country_id']
-    leads = models.execute_kw(
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'country_id', 'create_date']
+    limite_nuevos = datetime.now(timezone.utc) - timedelta(hours=24)
+    fecha_corte = limite_nuevos.strftime('%Y-%m-%d %H:%M:%S')
+
+    nuevos = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [[['stage_id', '=', id_prospectos]]],
-        {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'id desc'}
+        [[['stage_id', '=', id_prospectos], ['create_date', '>=', fecha_corte]]],
+        {'fields': campos, 'limit': LEADS_NUEVOS_POR_EJECUCION, 'order': 'create_date desc, id desc'}
+    )
+    ids_nuevos = [lead['id'] for lead in nuevos]
+
+    dominio_atrasados = [['stage_id', '=', id_prospectos], ['create_date', '<', fecha_corte]]
+    if ids_nuevos:
+        dominio_atrasados.append(['id', 'not in', ids_nuevos])
+
+    atrasados = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
+        [dominio_atrasados],
+        {'fields': campos, 'limit': LEADS_ATRASADOS_POR_EJECUCION, 'order': 'id asc'}
     )
 
-    print(f"Iniciando investigación con Google Search + Facebook en {len(leads)} leads...", flush=True)
+    leads = nuevos + atrasados
+    print(
+        f"Lote: {len(nuevos)} nuevos (últimas 24 h) + {len(atrasados)} atrasados. "
+        f"Total a revisar: {len(leads)}. Modelo: {MODELO_GEMINI}.",
+        flush=True
+    )
+
+    aprobados = 0
+    pendientes = 0
+    procesados = 0
 
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
-        
+
         info_ddgs = investigacion_profunda_con_google_search(lead)
-        
+
         try:
             resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
+        except CuotaGeminiAgotada as e:
+            print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
+            break
         except Exception as e:
-            print(f"Error con Gemini en este lead: {e}", flush=True)
-            time.sleep(5)
+            print(f"Error de Gemini en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
+            pendientes += 1
             continue
 
+        email_final = (resultado.email_elegido or '').strip().lower()
         telefono_formateado = limpiar_formato_celular(resultado.telefono_elegido)
-        email_final = resultado.email_elegido.strip().lower()
-
         email_actual = (lead.get('email_from') or '').strip().lower()
         telefono_actual = limpiar_formato_celular(lead.get('phone'))
 
         email_definitivo = email_final if email_final else email_actual
         telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
 
-        tiene_al_menos_un_dato_verificado = bool(email_final or telefono_formateado)
+        ambos_verificados = bool(
+            resultado.email_verificado and email_final and
+            resultado.telefono_verificado and telefono_formateado
+        )
+        aprobado_final = bool(
+            resultado.coincide_ubicacion_y_rubro and
+            resultado.datos_validos_y_verificados and
+            ambos_verificados
+        )
 
-        if not resultado.coincide_ubicacion_y_rubro or not tiene_al_menos_un_dato_verificado:
-            aprobado_final = False
-            motivo_ajustado = f"{resultado.motivo} [Mantenido en Prospectos: sin confirmación suficiente en internet]."
-        else:
-            aprobado_final = resultado.datos_validos_y_verificados
+        if aprobado_final:
             motivo_ajustado = resultado.motivo
+        else:
+            faltantes = []
+            if not (resultado.email_verificado and email_final):
+                faltantes.append("email no confirmado")
+            if not (resultado.telefono_verificado and telefono_formateado):
+                faltantes.append("teléfono no confirmado")
+            if not resultado.coincide_ubicacion_y_rubro:
+                faltantes.append("ubicación/rubro no confirmado")
+            motivo_ajustado = f"{resultado.motivo} [NO APROBADO: {', '.join(faltantes) or 'validación insuficiente'}]."
 
-        print(f"Resultado: Aprobado={aprobado_final} | CoincideDir={resultado.coincide_ubicacion_y_rubro} | Tel={telefono_definitivo} | Email={email_definitivo}", flush=True)
+        print(
+            f"Resultado: Aprobado={aprobado_final} | Email verificado={resultado.email_verificado} "
+            f"| Teléfono verificado={resultado.telefono_verificado} "
+            f"| Tel={telefono_definitivo} | Email={email_definitivo}",
+            flush=True
+        )
         print(f"Detalle: {motivo_ajustado}", flush=True)
 
         valores_actualizar = {}
-
-        if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual:
+        if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual and resultado.email_verificado:
             valores_actualizar['email_from'] = email_final
-            print(f"-> Actualizando Email en Odoo: {email_actual or 'VACÍO'} => {email_final}", flush=True)
-
-        if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != lead.get('phone'):
+        if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != telefono_actual and resultado.telefono_verificado:
             valores_actualizar['phone'] = telefono_formateado
-            print(f"-> Actualizando Teléfono en Odoo: {lead.get('phone') or 'VACÍO'} => {telefono_formateado}", flush=True)
-
         if aprobado_final:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
-            print(f"-> Lead VERIFICADO. Moviendo a etapa ID {ID_ETAPA_CHEQUEADO}.", flush=True)
-        else:
-            print("-> Permanece en Prospectos por Controlar.", flush=True)
 
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
@@ -299,7 +357,17 @@ def ejecutar_agente():
         mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': mensaje_nota})
 
-        time.sleep(4)
+        procesados += 1
+        if aprobado_final:
+            aprobados += 1
+        else:
+            pendientes += 1
+
+    print(
+        f"\nRESUMEN: procesados={procesados}/{len(leads)} | aprobados={aprobados} "
+        f"| pendientes={pendientes} | sin procesar por corte de cuota={len(leads)-procesados}",
+        flush=True
+    )
 
 if __name__ == "__main__":
     ejecutar_agente()
