@@ -2,15 +2,19 @@ name: Agente Verificador de Leads Odoo
 
 on:
   schedule:
-    # Se ejecuta automáticamente cada 30 minutos
-    - cron: '*/30 * * * *'
-  workflow_dispatch: # Permite ejecutarlo manualmente con un botón
-  repository_dispatch: # Permite que Odoo lo dispare al crear un lead
-    types: [nuevo_lead_creado]
+    # Una ejecución diaria, después de la ventana habitual del buscador de leads.
+    - cron: '0 16 * * *'
+  workflow_dispatch: # Permite ejecución manual controlada.
+
+# Evita dos verificaciones simultáneas que dupliquen consumo de Gemini.
+concurrency:
+  group: verificador-leads-odoo
+  cancel-in-progress: false
 
 jobs:
   verificar-leads:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
