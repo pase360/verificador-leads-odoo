@@ -36,15 +36,29 @@ class ResultadoValidacion(BaseModel):
 class CuotaGeminiAgotada(Exception):
     pass
 
+class ServicioGeminiTemporal(Exception):
+    pass
+
 def generar_con_gemini(**kwargs):
-    time.sleep(INTERVALO_GEMINI_SEGUNDOS)
-    try:
-        return client_ai.models.generate_content(**kwargs)
-    except Exception as exc:
-        mensaje = str(exc).lower()
-        if "429" in mensaje or "resource_exhausted" in mensaje or "quota" in mensaje or "rate limit" in mensaje:
-            raise CuotaGeminiAgotada(str(exc)) from exc
-        raise
+    ultimo_error = None
+    for intento in range(3):
+        time.sleep(INTERVALO_GEMINI_SEGUNDOS)
+        try:
+            return client_ai.models.generate_content(**kwargs)
+        except Exception as exc:
+            mensaje = str(exc).lower()
+            if "429" in mensaje or "resource_exhausted" in mensaje or "quota" in mensaje or "rate limit" in mensaje:
+                raise CuotaGeminiAgotada(str(exc)) from exc
+            if any(x in mensaje for x in ("503", "unavailable", "service unavailable", "deadline exceeded", "timed out", "timeout")):
+                ultimo_error = exc
+                if intento < 2:
+                    espera = 15 * (2 ** intento)
+                    print(f"Gemini temporalmente no disponible. Reintento {intento + 1}/2 en {espera} segundos.", flush=True)
+                    time.sleep(espera)
+                    continue
+                raise ServicioGeminiTemporal(str(exc)) from exc
+            raise
+    raise ServicioGeminiTemporal(str(ultimo_error or "Gemini no disponible"))
 
 def conectar_odoo():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
@@ -324,6 +338,9 @@ def ejecutar_agente():
             resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
         except CuotaGeminiAgotada as e:
             print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
+            break
+        except ServicioGeminiTemporal as e:
+            print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene la ejecución y el lead queda pendiente: {e}", flush=True)
             break
         except Exception as e:
             print(f"Error de Gemini en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
