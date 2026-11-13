@@ -262,14 +262,32 @@ def ejecutar_agente():
     limite_nuevos = datetime.now(timezone.utc) - timedelta(hours=24)
     fecha_corte = limite_nuevos.strftime('%Y-%m-%d %H:%M:%S')
 
+    # Las notas del propio agente funcionan como registro persistente de revisión.
+    # Así los leads no aprobados no vuelven a ocupar el lote de mañana.
+    mensajes_revisados = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
+        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:']]],
+        {'fields': ['res_id'], 'limit': 10000, 'order': 'id desc'}
+    )
+    ids_revisados = {m.get('res_id') for m in mensajes_revisados if m.get('res_id')}
+
+    dominio_nuevos = [['stage_id', '=', id_prospectos], ['create_date', '>=', fecha_corte]]
+    if ids_revisados:
+        dominio_nuevos.append(['id', 'not in', list(ids_revisados)])
+
     nuevos = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [[['stage_id', '=', id_prospectos], ['create_date', '>=', fecha_corte]]],
+        [dominio_nuevos],
         {'fields': campos, 'limit': LEADS_NUEVOS_POR_EJECUCION, 'order': 'create_date desc, id desc'}
     )
     ids_nuevos = [lead['id'] for lead in nuevos]
 
-    dominio_atrasados = [['stage_id', '=', id_prospectos], ['create_date', '<', fecha_corte]]
+    dominio_atrasados = [
+        ['stage_id', '=', id_prospectos],
+        ['create_date', '<', fecha_corte]
+    ]
+    if ids_revisados:
+        dominio_atrasados.append(['id', 'not in', list(ids_revisados)])
     if ids_nuevos:
         dominio_atrasados.append(['id', 'not in', ids_nuevos])
 
