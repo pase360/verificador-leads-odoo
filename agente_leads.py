@@ -17,8 +17,8 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-LEADS_NUEVOS_POR_EJECUCION = 50
-LEADS_ATRASADOS_POR_EJECUCION = 350
+LEADS_NUEVOS_POR_EJECUCION = 10
+LEADS_ATRASADOS_POR_EJECUCION = 20
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.1-flash-lite"
 
@@ -51,6 +51,15 @@ def conectar_odoo():
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
+
+def es_cordoba_capital(lead):
+    ciudad = (lead.get('city') or '').strip().lower()
+    ciudad = (ciudad.replace('á', 'a').replace('é', 'e')
+                   .replace('í', 'i').replace('ó', 'o').replace('ú', 'u'))
+    # Sin ciudad explícita no se presume que una dirección de la provincia
+    # pertenezca a Córdoba Capital.
+    return ciudad in ('cordoba', 'cordoba capital', 'capital')
+
 
 def limpiar_nombre_busqueda(nombre):
     palabras_rubro = [
@@ -197,22 +206,26 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     {info_duckduckgo}
 
     INSTRUCCIONES OBLIGATORIAS DE BÚSQUEDA Y VALIDACIÓN:
-    1. USA ÚNICAMENTE LA EVIDENCIA DE BÚSQUEDA INCLUIDA ABAJO:
-       - Revisa los resultados de DuckDuckGo, las páginas oficiales y los datos extraídos de las webs.
-       - No afirmes que consultaste Google Maps, Facebook o Instagram si los resultados no lo demuestran.
-       - Si la evidencia no alcanza para confirmar un dato, déjalo sin verificar.
-    2. CORRECCIÓN DE TELÉFONO Y SELECCIÓN SI HAY VARIOS:
-       - Si el teléfono publicado en la página oficial de Facebook, Instagram o web del comercio NO coincide con el teléfono de Odoo, EL DE LA WEB/RED SOCIAL ES EL CORRECTO y debes devolverlo en 'telefono_elegido' (normalizado con +549 adelante, ej. +5493516591654) para sobrescribir Odoo.
-       - Si hay más de un teléfono, prioriza siempre el que indique WhatsApp o sea móvil.
-    3. SELECCIÓN DE EMAIL Y CERO INVENCIÓN:
-       - Extrae únicamente correos que existan literalmente en Google, Facebook, Instagram o la web del comercio. Nunca inventes correos.
-       - Si hay varios correos, elige el más adecuado para propuestas comerciales o alianzas (comercial@, marketing@, contacto@, info@, administracion@ o el correo principal del comercio).
-    4. REGLA DE APROBACIÓN:
-       - Devuelve email_verificado=TRUE solo si el correo elegido aparece literalmente en una fuente pública confiable y pertenece a este comercio/sucursal.
-       - Devuelve telefono_verificado=TRUE solo si el teléfono elegido aparece en una fuente pública confiable y pertenece a este comercio/sucursal.
-       - Para aprobar, ambos canales deben estar presentes y verificados. Si falta uno, buscá más; si no aparece, devolvé FALSE.
-       - Si un dato actual de Odoo es incorrecto, reemplazalo solo con el dato correcto respaldado por evidencia.
-       - datos_validos_y_verificados=TRUE únicamente si coinciden comercio, ubicación y rubro, y email_verificado y telefono_verificado son TRUE.
+    1. USA ÚNICAMENTE LA EVIDENCIA INCLUIDA:
+       - Usa solo los resultados de DuckDuckGo y el contenido de páginas efectivamente descargadas.
+       - No afirmes haber consultado fuentes que no aparecen en la evidencia.
+       - No completes datos por intuición ni por similitud de nombres.
+    2. IDENTIDAD, UBICACIÓN Y RUBRO:
+       - Confirma que el nombre corresponde al comercio buscado y que la dirección/sucursal coincide con la dirección exacta de Odoo.
+       - Confirma que el rubro es compatible con el comercio. No uses datos de otra sucursal, otra ciudad, otro negocio homónimo ni de la marca en general si no se puede vincular al local.
+       - Si no puedes confirmar comercio, dirección y rubro con evidencia concreta, coincide_ubicacion_y_rubro=FALSE y no apruebes.
+    3. TELÉFONO OBLIGATORIO:
+       - telefono_verificado=TRUE solo si el número aparece literalmente en una fuente pública confiable y se puede vincular a este comercio/sucursal.
+       - Si el teléfono oficial encontrado difiere del de Odoo, devuelve el oficial normalizado con +549 cuando corresponda.
+       - Prioriza WhatsApp o móvil si hay varios. Nunca valides un teléfono solo porque figura en Odoo.
+    4. EMAIL OPCIONAL:
+       - El email NO es requisito para aprobar.
+       - Si encuentras un correo publicado literalmente y vinculado a este comercio/sucursal, devuelve email_elegido y email_verificado=TRUE.
+       - Si no encuentras email confiable, devuelve email_elegido="" y email_verificado=FALSE. Esto NO debe impedir la aprobación.
+       - Nunca inventes ni atribuyas emails de negocios homónimos, otras sucursales o empresas de otra ciudad.
+    5. RESULTADO:
+       - datos_validos_y_verificados=TRUE si y solo si la identidad del comercio, la dirección exacta/sucursal, el rubro y el teléfono están confirmados.
+       - No exijas email para datos_validos_y_verificados.
        - Nunca marques como verificado un dato solo porque ya estaba cargado en Odoo.
     """
 
@@ -248,18 +261,19 @@ def ejecutar_agente():
     limite_nuevos = datetime.now(timezone.utc) - timedelta(hours=24)
     fecha_corte = limite_nuevos.strftime('%Y-%m-%d %H:%M:%S')
 
-    # Las notas del propio agente funcionan como registro persistente de revisión.
-    # Así los leads no aprobados no vuelven a ocupar el lote de mañana.
-    mensajes_revisados = models.execute_kw(
+    # Los aprobados salen de Prospectos al pasar a la etapa verificada.
+    # Los pendientes se vuelven a revisar en lotes controlados para que un
+    # error temporal o una auditoría sin email no los deje bloqueados.
+    mensajes_fuera = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
-        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:']]],
+        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Fuera de alcance: Córdoba Capital']]],
         {'fields': ['res_id'], 'limit': 10000, 'order': 'id desc'}
     )
-    ids_revisados = {m.get('res_id') for m in mensajes_revisados if m.get('res_id')}
+    ids_fuera_alcance = {m.get('res_id') for m in mensajes_fuera if m.get('res_id')}
 
     dominio_nuevos = [['stage_id', '=', id_prospectos], ['create_date', '>=', fecha_corte]]
-    if ids_revisados:
-        dominio_nuevos.append(['id', 'not in', list(ids_revisados)])
+    if ids_fuera_alcance:
+        dominio_nuevos.append(['id', 'not in', list(ids_fuera_alcance)])
 
     nuevos = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
@@ -272,8 +286,8 @@ def ejecutar_agente():
         ['stage_id', '=', id_prospectos],
         ['create_date', '<', fecha_corte]
     ]
-    if ids_revisados:
-        dominio_atrasados.append(['id', 'not in', list(ids_revisados)])
+    if ids_fuera_alcance:
+        dominio_atrasados.append(['id', 'not in', list(ids_fuera_alcance)])
     if ids_nuevos:
         dominio_atrasados.append(['id', 'not in', ids_nuevos])
 
@@ -297,6 +311,13 @@ def ejecutar_agente():
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
 
+        if not es_cordoba_capital(lead):
+            nota_fuera = "Fuera de alcance: Córdoba Capital. No se audita porque el campo ciudad de Odoo no confirma Córdoba Capital."
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': nota_fuera})
+            print(f"Fuera de alcance: ciudad Odoo='{lead.get('city') or 'vacía'}'.", flush=True)
+            procesados += 1
+            continue
+
         info_ddgs = investigacion_profunda_con_google_search(lead)
 
         try:
@@ -317,23 +338,18 @@ def ejecutar_agente():
         email_definitivo = email_final if email_final else email_actual
         telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
 
-        ambos_verificados = bool(
-            resultado.email_verificado and email_final and
-            resultado.telefono_verificado and telefono_formateado
-        )
+        telefono_verificado = bool(resultado.telefono_verificado and telefono_formateado)
         aprobado_final = bool(
             resultado.coincide_ubicacion_y_rubro and
             resultado.datos_validos_y_verificados and
-            ambos_verificados
+            telefono_verificado
         )
 
         if aprobado_final:
             motivo_ajustado = resultado.motivo
         else:
             faltantes = []
-            if not (resultado.email_verificado and email_final):
-                faltantes.append("email no confirmado")
-            if not (resultado.telefono_verificado and telefono_formateado):
+            if not telefono_verificado:
                 faltantes.append("teléfono no confirmado")
             if not resultado.coincide_ubicacion_y_rubro:
                 faltantes.append("ubicación/rubro no confirmado")
