@@ -185,7 +185,7 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     telefono_actual = lead.get('phone') or 'VACÍO'
 
     prompt = f"""
-    Eres un investigador experto en empresas y comercios de Argentina. Usa tu herramienta de búsqueda en Google (Google Search) Y los resultados proporcionados abajo para encontrar el EMAIL y el TELÉFONO/WHATSAPP reales de este comercio.
+    Eres un investigador experto en empresas y comercios de Argentina. Usa los resultados de DuckDuckGo y las páginas web obtenidas previamente para encontrar el EMAIL y el TELÉFONO/WHATSAPP reales de este comercio.
 
     DATOS EN ODOO:
     - Nombre en Odoo: {nombre_original} (Nombre corto en redes: {nombre_corto})
