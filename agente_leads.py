@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
 LEADS_NUEVOS_POR_EJECUCION = 50
-LEADS_ATRASADOS_POR_EJECUCION = 150
+LEADS_ATRASADOS_POR_EJECUCION = 350
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.1-flash-lite"
 
@@ -197,9 +197,10 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     {info_duckduckgo}
 
     INSTRUCCIONES OBLIGATORIAS DE BÚSQUEDA Y VALIDACIÓN:
-    1. USA GOOGLE SEARCH AHORA MISMO:
-       - Busca en Google: "{nombre_corto}" "{direccion.split(',')[0]}" {ciudad} facebook OR instagram OR email OR telefono
-       - Revisa las fichas públicas de Google Maps, Facebook, Instagram y directorios para obtener el teléfono y el correo electrónico real del comercio.
+    1. USA ÚNICAMENTE LA EVIDENCIA DE BÚSQUEDA INCLUIDA ABAJO:
+       - Revisa los resultados de DuckDuckGo, las páginas oficiales y los datos extraídos de las webs.
+       - No afirmes que consultaste Google Maps, Facebook o Instagram si los resultados no lo demuestran.
+       - Si la evidencia no alcanza para confirmar un dato, déjalo sin verificar.
     2. CORRECCIÓN DE TELÉFONO Y SELECCIÓN SI HAY VARIOS:
        - Si el teléfono publicado en la página oficial de Facebook, Instagram o web del comercio NO coincide con el teléfono de Odoo, EL DE LA WEB/RED SOCIAL ES EL CORRECTO y debes devolverlo en 'telefono_elegido' (normalizado con +549 adelante, ej. +5493516591654) para sobrescribir Odoo.
        - Si hay más de un teléfono, prioriza siempre el que indique WhatsApp o sea móvil.
@@ -215,25 +216,10 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
        - Nunca marques como verificado un dato solo porque ya estaba cargado en Odoo.
     """
 
-    # Paso 1: Ejecutar Google Search Grounding (sin response_mime_type JSON para evitar error 400 de la API)
-    busqueda_google = generar_con_gemini(
-        model=MODELO_GEMINI,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[{"google_search": {}}],
-            temperature=0.0,
-        ),
-    )
-    hallazgos_google = busqueda_google.text or "Sin hallazgos adicionales en Google."
-
-    # Paso 2: Estructurar la respuesta en el formato exacto de Odoo
-    prompt_estructurado = f"""
-    Con base en los hallazgos obtenidos, extrae los campos finales en JSON estricto:
-    {hallazgos_google}
-    """
+    # Una sola llamada por lead: toda la evidencia ya fue reunida por DuckDuckGo y la lectura de webs.
     response = generar_con_gemini(
         model=MODELO_GEMINI,
-        contents=prompt_estructurado,
+        contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ResultadoValidacion,
