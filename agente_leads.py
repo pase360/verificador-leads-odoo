@@ -125,7 +125,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
         # El teléfono sugerido por Gemini debe aparecer literalmente, con formato
         # variable, en esa misma fuente. No basta con que aparezca en otro resultado.
         if telefono_ia:
-            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)', bloque)
+            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)', bloque)
             for candidato in candidatos:
                 if limpiar_formato_celular(candidato) == telefono_ia:
                     telefono_ok = True
