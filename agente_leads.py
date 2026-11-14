@@ -80,7 +80,7 @@ def extraer_codigos_postales(lead):
     textos = [str(lead.get('zip') or ''), str(lead.get('street') or '')]
     encontrados = []
     for texto in textos:
-        encontrados.extend(re.findall(r'(?<![A-Z0-9])([A-Z]\\d{4}[A-Z]{3}|[A-Z]\\d{4})(?![A-Z0-9])', texto.upper()))
+        encontrados.extend(re.findall(r'(?<![A-Z0-9])([A-Z]\d{4}[A-Z]{3}|[A-Z]\d{4})(?![A-Z0-9])', texto.upper()))
     return list(dict.fromkeys(encontrados))
 
 
@@ -176,39 +176,39 @@ def clasificar_alcance_geografico(lead):
     # Si la dirección identifica expresamente otra provincia o localidad, no consultar
     # el geocodificador para intentar reinterpretarla.
     patrones_fuera = (
-        r'\\bprovincia de buenos aires\\b',
-        r'\\bprovincia de santa fe\\b',
-        r'\\bprovincia de entre rios\\b',
-        r'\\bprovincia de san luis\\b',
-        r'\\bprovincia de la pampa\\b',
-        r'\\bprovincia de tucuman\\b',
-        r'\\bprovincia de salta\\b',
-        r'\\bprovincia de mendoza\\b',
-        r'\\bprovincia de neuquen\\b',
-        r'\\bprovincia de rio negro\\b',
-        r'\\bprovincia de chubut\\b',
-        r'\\bprovincia de santa cruz\\b',
-        r'\\bprovincia de misiones\\b',
-        r'\\bprovincia de corrientes\\b',
-        r'\\bprovincia de chaco\\b',
-        r'\\bprovincia de formosa\\b',
-        r'\\bprovincia de jujuy\\b',
-        r'\\bprovincia de catamarca\\b',
-        r'\\bprovincia de la rioja\\b',
-        r'\\bprovincia de san juan\\b',
-        r'\\bprovincia de santiago del estero\\b',
-        r'\\bprovincia de tierra del fuego\\b',
-        r'\\bbelen de escobar\\b',
-        r'\\bvilla allende\\b',
-        r'\\bvilla carlos paz\\b',
-        r'\\bcarlos paz\\b',
-        r'\\balta gracia\\b',
-        r'\\bvilla maria\\b',
-        r'\\brio cuarto\\b',
-        r'\\bsan francisco cordoba\\b',
-        r'\\bvilla del rosario\\b',
-        r'\\bsaldan\\b',
-        r'\\bla calera\\b'
+        r'\bprovincia de buenos aires\b',
+        r'\bprovincia de santa fe\b',
+        r'\bprovincia de entre rios\b',
+        r'\bprovincia de san luis\b',
+        r'\bprovincia de la pampa\b',
+        r'\bprovincia de tucuman\b',
+        r'\bprovincia de salta\b',
+        r'\bprovincia de mendoza\b',
+        r'\bprovincia de neuquen\b',
+        r'\bprovincia de rio negro\b',
+        r'\bprovincia de chubut\b',
+        r'\bprovincia de santa cruz\b',
+        r'\bprovincia de misiones\b',
+        r'\bprovincia de corrientes\b',
+        r'\bprovincia de chaco\b',
+        r'\bprovincia de formosa\b',
+        r'\bprovincia de jujuy\b',
+        r'\bprovincia de catamarca\b',
+        r'\bprovincia de la rioja\b',
+        r'\bprovincia de san juan\b',
+        r'\bprovincia de santiago del estero\b',
+        r'\bprovincia de tierra del fuego\b',
+        r'\bbelen de escobar\b',
+        r'\bvilla allende\b',
+        r'\bvilla carlos paz\b',
+        r'\bcarlos paz\b',
+        r'\balta gracia\b',
+        r'\bvilla maria\b',
+        r'\brio cuarto\b',
+        r'\bsan francisco cordoba\b',
+        r'\bvilla del rosario\b',
+        r'\bsaldan\b',
+        r'\bla calera\b'
     )
     if any(re.search(patron, direccion) for patron in patrones_fuera):
         return 'FUERA_DE_ALCANCE'
