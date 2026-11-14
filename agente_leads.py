@@ -271,9 +271,21 @@ def ejecutar_agente():
     # No se crean contactos, leads ni oportunidades nuevas.
     id_prospectos = 5
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'country_id']
+    # Evita repetir los mismos 50 pendientes todos los días.
+    # Un lead auditado se puede volver a intentar después de 7 días.
+    fecha_reintento = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    mensajes_recientes = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
+        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:'], ['date', '>=', fecha_reintento]]],
+        {'fields': ['res_id'], 'limit': 10000, 'order': 'id desc'}
+    )
+    ids_aun_revisados = list({m.get('res_id') for m in mensajes_recientes if m.get('res_id')})
+    dominio = [['stage_id', '=', id_prospectos]]
+    if ids_aun_revisados:
+        dominio.append(['id', 'not in', ids_aun_revisados])
     leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [[['stage_id', '=', id_prospectos]]],
+        [dominio],
         {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'id asc'}
     )
     print(
