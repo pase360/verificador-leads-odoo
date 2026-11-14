@@ -86,19 +86,30 @@ def extraer_codigos_postales(lead):
 
 def consultar_georef_direccion(lead, codigo_postal):
     """
-    Consulta la API oficial Georef con la dirección completa.
-    El código postal se conserva en el texto enviado para mejorar la identificación.
-    No se fuerza el departamento Capital: se comprueba el resultado real para evitar
-    convertir por error una dirección de otra localidad en Córdoba Capital.
+    Normaliza únicamente calle y altura, como exige Georef.
+    Filtra desde la API por provincia Córdoba y departamento Capital.
+    Solo confirma si la respuesta identifica sin ambigüedad la misma altura.
     """
-    direccion = str(lead.get('street') or '').strip()
-    if not direccion:
+    direccion_original = str(lead.get('street') or '').strip()
+    if not direccion_original:
         return 'UBICACION_INCIERTA', 'No hay dirección para georreferenciar'
 
-    if codigo_postal and codigo_postal.lower() not in direccion.lower():
-        direccion_consulta = f"{direccion}, {codigo_postal}"
-    else:
-        direccion_consulta = direccion
+    # Georef requiere calle/altura, no localidad, provincia ni código postal.
+    # En Odoo suelen estar separados por comas: "Av. Colón 52, X5000 Córdoba, Argentina".
+    direccion_consulta = direccion_original.split(',')[0].strip()
+    direccion_consulta = re.sub(
+        r'(?<![A-Z0-9])[A-Z]\d{4}[A-Z]{3}(?![A-Z0-9])|(?<![A-Z0-9])[A-Z]\d{4}(?![A-Z0-9])',
+        ' ', direccion_consulta, flags=re.IGNORECASE
+    )
+    direccion_consulta = re.sub(
+        r'\b(Argentina|Córdoba|Cordoba|Capital)\b',
+        ' ', direccion_consulta, flags=re.IGNORECASE
+    )
+    direccion_consulta = re.sub(r'\s+', ' ', direccion_consulta).strip(' ,.-')
+    alturas = re.findall(r'\d+', direccion_consulta)
+    if not direccion_consulta or not alturas:
+        return 'UBICACION_INCIERTA', 'No se pudo separar calle y altura de la dirección de Odoo'
+    altura_esperada = alturas[-1]
 
     try:
         respuesta = requests.get(
@@ -106,10 +117,12 @@ def consultar_georef_direccion(lead, codigo_postal):
             params={
                 "direccion": direccion_consulta,
                 "provincia": "cordoba",
-                "max": 5
+                "departamento": "capital",
+                "max": 10,
+                "campos": "estandar"
             },
             headers={"User-Agent": "Pase360-VerificadorLeads/1.0"},
-            timeout=12
+            timeout=15
         )
         respuesta.raise_for_status()
         datos = respuesta.json()
@@ -117,34 +130,38 @@ def consultar_georef_direccion(lead, codigo_postal):
         return 'UBICACION_INCIERTA', f"No se pudo consultar Georef: {exc}"
 
     resultados = datos.get('direcciones') or []
-    if len(resultados) != 1:
-        return 'UBICACION_INCIERTA', f"Georef devolvió {len(resultados)} coincidencias; no hay identificación única"
+    if not resultados:
+        return 'UBICACION_INCIERTA', 'Georef no encontró la dirección dentro del departamento Capital'
 
-    item = resultados[0]
-    provincia_item = normalizar_texto((item.get('provincia') or {}).get('nombre') or '')
-    departamento_item = normalizar_texto((item.get('departamento') or {}).get('nombre') or '')
-    localidad_item = normalizar_texto(
-        (item.get('localidad_censal') or {}).get('nombre') or
-        (item.get('localidad') or {}).get('nombre') or ''
-    )
+    coincidencias = []
+    for item in resultados:
+        provincia_item = normalizar_texto((item.get('provincia') or {}).get('nombre') or '')
+        departamento_item = normalizar_texto((item.get('departamento') or {}).get('nombre') or '')
+        localidad_item = normalizar_texto((item.get('localidad_censal') or {}).get('nombre') or '')
+        altura_item = (item.get('altura') or {}).get('valor')
+        calle_item = (item.get('calle') or {}).get('id') or (item.get('calle') or {}).get('nombre') or ''
 
-    if provincia_item and provincia_item != 'cordoba':
-        return 'FUERA_DE_ALCANCE', f"Georef ubica la dirección en {provincia_item}"
+        if provincia_item != 'cordoba' or departamento_item != 'capital':
+            continue
+        if localidad_item and localidad_item != 'cordoba':
+            continue
+        if altura_item is None or str(altura_item) != altura_esperada:
+            continue
+        coincidencias.append((str(calle_item), str(altura_item), localidad_item))
 
-    # En Córdoba, el departamento Capital identifica la jurisdicción de la ciudad.
-    # Si la API no devuelve departamento, no se aprueba por el mero prefijo X5.
-    if departamento_item == 'capital' and provincia_item == 'cordoba':
-        if localidad_item and localidad_item not in ('cordoba', 'cordoba capital'):
-            return 'UBICACION_INCIERTA', f"Georef devolvió localidad no coincidente: {localidad_item}"
+    unicas = set(coincidencias)
+    if len(unicas) == 1:
+        _, altura_confirmada, localidad = next(iter(unicas))
         return 'CORDOBA_CAPITAL', (
-            f"Georef confirmó Córdoba, departamento Capital"
-            + (f", localidad {localidad_item}" if localidad_item else "")
+            f"Georef confirmó Córdoba, departamento Capital, altura {altura_confirmada}"
+            + (f", localidad censal {localidad}" if localidad else "")
         )
 
-    if provincia_item == 'cordoba' and departamento_item:
-        return 'FUERA_DE_ALCANCE', f"Georef ubica la dirección en departamento {departamento_item}"
-
-    return 'UBICACION_INCIERTA', "Georef no confirmó el departamento Capital"
+    if len(unicas) > 1:
+        return 'UBICACION_INCIERTA', 'Georef devolvió más de una calle posible para esa altura'
+    return 'UBICACION_INCIERTA', (
+        f"Georef no pudo confirmar la altura {altura_esperada} en Córdoba Capital"
+    )
 
 
 def clasificar_alcance_geografico(lead):
