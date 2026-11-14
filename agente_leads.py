@@ -107,7 +107,7 @@ def clasificar_alcance_geografico(lead):
 
     # Si Odoo no completó city, solo aceptamos una mención explícita de Córdoba Capital
     # en la dirección. "Córdoba, Argentina" por sí solo no alcanza.
-    if re.search(r'\\bcordoba capital\\b', direccion):
+    if re.search(r'\bcordoba capital\b', direccion):
         return 'CORDOBA_CAPITAL'
     return 'UBICACION_INCIERTA'
 
