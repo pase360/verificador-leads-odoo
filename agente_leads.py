@@ -68,14 +68,73 @@ def conectar_odoo():
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
 
-def es_cordoba_capital(lead):
-    # La ciudad de Odoo puede estar vacía aunque la dirección esté completa.
-    # La pertenencia a Córdoba Capital se valida con evidencia durante la auditoría,
-    # no se descarta automáticamente por un campo city vacío.
-    ciudad = (lead.get('city') or '').strip().lower()
-    ciudad = (ciudad.replace('á', 'a').replace('é', 'e')
-                   .replace('í', 'i').replace('ó', 'o').replace('ú', 'u'))
-    return ciudad in ('cordoba', 'cordoba capital', 'capital')
+def normalizar_texto(valor):
+    valor = (valor or '').lower()
+    valor = valor.replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u')
+    valor = re.sub(r'[^a-z0-9]+', ' ', valor)
+    return re.sub(r'\\s+', ' ', valor).strip()
+
+
+def clasificar_alcance_geografico(lead):
+    """Devuelve CORDOBA_CAPITAL, FUERA_DE_ALCANCE o UBICACION_INCIERTA."""
+    ciudad = normalizar_texto(lead.get('city') or '')
+    pais = lead.get('country_id')
+    pais_nombre = normalizar_texto(pais[1] if isinstance(pais, (list, tuple)) and len(pais) > 1 else '')
+    provincia = lead.get('state_id')
+    provincia_nombre = normalizar_texto(provincia[1] if isinstance(provincia, (list, tuple)) and len(provincia) > 1 else '')
+    direccion = normalizar_texto(lead.get('street') or '')
+
+    if pais_nombre and pais_nombre not in ('argentina',):
+        return 'FUERA_DE_ALCANCE'
+    if provincia_nombre and provincia_nombre not in ('cordoba', 'cordoba capital'):
+        return 'FUERA_DE_ALCANCE'
+    if ciudad and ciudad not in ('cordoba', 'cordoba capital', 'capital'):
+        return 'FUERA_DE_ALCANCE'
+    if ciudad in ('cordoba', 'cordoba capital', 'capital'):
+        return 'CORDOBA_CAPITAL'
+    if 'cordoba capital' in direccion:
+        return 'CORDOBA_CAPITAL'
+    return 'UBICACION_INCIERTA'
+
+
+def evidencia_confirma_sucursal(lead, evidencia, resultado):
+    """Solo acepta datos si nombre + calle/número + teléfono aparecen en la misma fuente."""
+    nombre = normalizar_texto(lead.get('partner_name') or lead.get('name') or '')
+    direccion = normalizar_texto(lead.get('street') or '')
+    if not nombre or not direccion:
+        return False, False, False
+
+    # La dirección debe incluir calle y número; no alcanza con ciudad o barrio.
+    partes_direccion = direccion.split()
+    if len(partes_direccion) < 2 or not any(re.search(r'\\d', p) for p in partes_direccion):
+        return False, False, False
+
+    nombre_ok = False
+    telefono_ok = False
+    email_ok = False
+    telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
+    email_ia = (resultado.email_elegido or '').strip().lower()
+
+    for bloque in re.split(r'(?=\\n=== FUENTE INDIVIDUAL ===)', evidencia):
+        bloque_n = normalizar_texto(bloque)
+        # El nombre completo debe figurar en la misma fuente que la dirección.
+        if nombre not in bloque_n or direccion not in bloque_n:
+            continue
+        nombre_ok = True
+
+        # El teléfono sugerido por Gemini debe aparecer literalmente, con formato
+        # variable, en esa misma fuente. No basta con que aparezca en otro resultado.
+        if telefono_ia:
+            candidatos = re.findall(r'\\+?\\d[\\d\\s().-]{6,}\\d', bloque)
+            for candidato in candidatos:
+                if limpiar_formato_celular(candidato) == telefono_ia:
+                    telefono_ok = True
+                    break
+
+        if email_ia and email_ia in bloque.lower():
+            email_ok = True
+
+    return nombre_ok, telefono_ok, email_ok
 
 
 def limpiar_nombre_busqueda(nombre):
@@ -166,7 +225,7 @@ def investigacion_profunda_con_google_search(lead):
     snippets1 = []
     for item in res1:
         link = item.get('href', '')
-        snippets1.append(f"- {item.get('title')} | {item.get('body')} | {link}")
+        snippets1.append(f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {item.get('title')}\\nTexto: {item.get('body')}\\nURL: {link}")
         if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
             urls_encontradas.append(link)
     if snippets1:
@@ -177,7 +236,7 @@ def investigacion_profunda_con_google_search(lead):
     print(f"-> Buscando en Facebook/Instagram: {q2}", flush=True)
     res2 = ejecutar_consulta_ddgs(q2, max_res=6)
     if res2:
-        snippets2 = [f"- {i.get('title')} | {i.get('body')} | {i.get('href')}" for i in res2]
+        snippets2 = [f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {i.get('title')}\\nTexto: {i.get('body')}\\nURL: {i.get('href')}" for i in res2]
         reporte_total.append("=== RESULTADOS DE FACEBOOK E INSTAGRAM ===\n" + "\n".join(snippets2))
     time.sleep(1)
 
@@ -185,7 +244,7 @@ def investigacion_profunda_con_google_search(lead):
     print(f"-> Rastreando correos electrónicos: {q3}", flush=True)
     res3 = ejecutar_consulta_ddgs(q3, max_res=5)
     if res3:
-        snippets3 = [f"- {i.get('title')} | {i.get('body')} | {i.get('href')}" for i in res3]
+        snippets3 = [f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {i.get('title')}\\nTexto: {i.get('body')}\\nURL: {i.get('href')}" for i in res3]
         reporte_total.append("=== RASTREO DE EMAILS ===\n" + "\n".join(snippets3))
     time.sleep(1)
 
@@ -270,7 +329,7 @@ def ejecutar_agente():
     # SOLO se leen leads ya existentes en la etapa Prospectos por Controlar.
     # No se crean contactos, leads ni oportunidades nuevas.
     id_prospectos = 5
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'country_id']
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id']
     # Evita repetir los mismos 50 pendientes todos los días.
     # Un lead auditado se puede volver a intentar después de 7 días.
     fecha_reintento = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
@@ -303,11 +362,38 @@ def ejecutar_agente():
     procesados = 0
     fallas_busqueda = 0
     no_auditados = 0
+    fuera_alcance = 0
 
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
 
         try:
+            alcance = clasificar_alcance_geografico(lead)
+            if alcance == 'FUERA_DE_ALCANCE':
+                nota = (
+                    "Agente de Verificación: FUERA DE ALCANCE. La dirección cargada en Odoo "
+                    f"no corresponde a Córdoba Capital (ciudad: {lead.get('city') or 'sin ciudad'}, "
+                    f"provincia: {(lead.get('state_id') or ['', ''])[1] if isinstance(lead.get('state_id'), (list, tuple)) and len(lead.get('state_id')) > 1 else 'sin provincia'}, "
+                    f"país: {(lead.get('country_id') or ['', ''])[1] if isinstance(lead.get('country_id'), (list, tuple)) and len(lead.get('country_id')) > 1 else 'sin país'}). "
+                    "No se realizó búsqueda ni se modificaron datos."
+                )
+                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota})
+                procesados += 1
+                fuera_alcance += 1
+                print(nota, flush=True)
+                continue
+            if alcance == 'UBICACION_INCIERTA':
+                nota = (
+                    "Agente de Verificación: PENDIENTE. Odoo no identifica inequívocamente "
+                    "Córdoba Capital en los campos de localidad/provincia. No se realizó búsqueda "
+                    "ni se modificaron datos para evitar aprobar otra localidad."
+                )
+                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota})
+                procesados += 1
+                pendientes += 1
+                print(nota, flush=True)
+                continue
+
             info_ddgs = investigacion_profunda_con_google_search(lead)
             resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
         except BusquedaSinEvidencia as e:
@@ -334,10 +420,18 @@ def ejecutar_agente():
         email_definitivo = email_final if email_final else email_actual
         telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
 
-        telefono_verificado = bool(resultado.telefono_verificado and telefono_formateado)
+        evidencia_nombre_direccion, evidencia_telefono, evidencia_email = evidencia_confirma_sucursal(
+            lead, info_ddgs, resultado
+        )
+        telefono_verificado = bool(
+            resultado.telefono_verificado and telefono_formateado and evidencia_telefono
+        )
+        identidad_sucursal_verificada = bool(evidencia_nombre_direccion and evidencia_telefono)
         aprobado_final = bool(
+            alcance == 'CORDOBA_CAPITAL' and
             resultado.coincide_ubicacion_y_rubro and
             resultado.datos_validos_y_verificados and
+            identidad_sucursal_verificada and
             telefono_verificado
         )
 
@@ -347,8 +441,10 @@ def ejecutar_agente():
             faltantes = []
             if not telefono_verificado:
                 faltantes.append("teléfono no confirmado")
-            if not resultado.coincide_ubicacion_y_rubro:
-                faltantes.append("ubicación/rubro no confirmado")
+            if not resultado.coincide_ubicacion_y_rubro or not evidencia_nombre_direccion:
+                faltantes.append("nombre y dirección exacta no demostrados en una misma fuente")
+            if not evidencia_telefono:
+                faltantes.append("teléfono no vinculado públicamente a esa sucursal")
             motivo_ajustado = f"{resultado.motivo} [NO APROBADO: {', '.join(faltantes) or 'validación insuficiente'}]."
 
         print(
@@ -360,9 +456,9 @@ def ejecutar_agente():
         print(f"Detalle: {motivo_ajustado}", flush=True)
 
         valores_actualizar = {}
-        if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual and resultado.email_verificado:
+        if evidencia_nombre_direccion and evidencia_email and email_final and email_final != email_actual and resultado.email_verificado:
             valores_actualizar['email_from'] = email_final
-        if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != telefono_actual and resultado.telefono_verificado:
+        if evidencia_nombre_direccion and evidencia_telefono and telefono_formateado and telefono_formateado != telefono_actual and resultado.telefono_verificado:
             valores_actualizar['phone'] = telefono_formateado
         if aprobado_final:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
@@ -381,8 +477,8 @@ def ejecutar_agente():
 
     print(
         f"\nRESUMEN: encontrados={len(leads)} | auditados={procesados} | aprobados={aprobados} "
-        f"| pendientes_auditados={pendientes} | fallas_busqueda={fallas_busqueda} "
-        f"| no_auditados={len(leads)-procesados-fallas_busqueda}",
+        f"| pendientes_auditados={pendientes} | fuera_alcance={fuera_alcance} "
+        f"| fallas_busqueda={fallas_busqueda} | no_auditados={len(leads)-procesados-fallas_busqueda}",
         flush=True
     )
 
