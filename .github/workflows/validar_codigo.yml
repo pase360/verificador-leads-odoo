@@ -1,0 +1,19 @@
+name: Validar sintaxis del agente
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Comprobar sintaxis sin conectarse a Odoo
+        run: python -m py_compile agente_leads.py
