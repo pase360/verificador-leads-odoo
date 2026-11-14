@@ -125,7 +125,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
         # El teléfono sugerido por Gemini debe aparecer literalmente, con formato
         # variable, en esa misma fuente. No basta con que aparezca en otro resultado.
         if telefono_ia:
-            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{6,8}(?!\d)', bloque)
+            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)', bloque)
             for candidato in candidatos:
                 if limpiar_formato_celular(candidato) == telefono_ia:
                     telefono_ok = True
@@ -157,18 +157,22 @@ def limpiar_formato_celular(numero):
     solo_digitos = re.sub(r'\D', '', str(numero))
     if not solo_digitos:
         return ""
+    # Si el número ya viene internacional y contiene el 9 de móvil, conservarlo.
     if solo_digitos.startswith("549") and len(solo_digitos) == 13:
         return f"+{solo_digitos}"
+    # No agregar el 9 móvil a teléfonos fijos: solo conservar el código internacional.
     if solo_digitos.startswith("54") and len(solo_digitos) == 12:
-        return f"+549{solo_digitos[2:]}"
-    if solo_digitos.startswith("0") and len(solo_digitos) == 11:
-        return f"+549{solo_digitos[1:]}"
-    if len(solo_digitos) == 10:
-        return f"+549{solo_digitos}"
+        return f"+{solo_digitos}"
+    # Formato argentino con 0 + característica + 15 + número móvil.
     if solo_digitos.startswith("0") and len(solo_digitos) == 13 and solo_digitos[4:6] == "15":
         return f"+549{solo_digitos[1:4]}{solo_digitos[6:]}"
     if len(solo_digitos) == 12 and solo_digitos[3:5] == "15":
         return f"+549{solo_digitos[:3]}{solo_digitos[5:]}"
+    # Formatos nacionales sin indicador de móvil: no inventar el prefijo 9.
+    if solo_digitos.startswith("0") and len(solo_digitos) == 11:
+        return f"+54{solo_digitos[1:]}"
+    if len(solo_digitos) == 10:
+        return f"+54{solo_digitos}"
     return f"+{solo_digitos}" if str(numero).strip().startswith("+") else solo_digitos
 
 def extraer_texto_de_url(url):
