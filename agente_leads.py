@@ -105,8 +105,44 @@ def clasificar_alcance_geografico(lead):
     if ciudad:
         return 'FUERA_DE_ALCANCE'
 
-    # Si Odoo no completó city, solo aceptamos una mención explícita de Córdoba Capital
-    # en la dirección. "Córdoba, Argentina" por sí solo no alcanza.
+    # Si city está vacío, detectar primero provincias/localidades explícitamente ajenas.
+    # Esto evita dejar como incierto un domicilio que dice, por ejemplo, Provincia de Buenos Aires.
+    patrones_fuera = (
+        r'\bprovincia de buenos aires\b',
+        r'\bprovincia de santa fe\b',
+        r'\bprovincia de entre rios\b',
+        r'\bprovincia de san luis\b',
+        r'\bprovincia de la pampa\b',
+        r'\bprovincia de tucuman\b',
+        r'\bprovincia de salta\b',
+        r'\bprovincia de mendoza\b',
+        r'\bprovincia de neuquen\b',
+        r'\bprovincia de rio negro\b',
+        r'\bprovincia de chubut\b',
+        r'\bprovincia de santa cruz\b',
+        r'\bprovincia de misiones\b',
+        r'\bprovincia de corrientes\b',
+        r'\bprovincia de chaco\b',
+        r'\bprovincia de formosa\b',
+        r'\bprovincia de jujuy\b',
+        r'\bprovincia de catamarca\b',
+        r'\bprovincia de la rioja\b',
+        r'\bprovincia de san juan\b',
+        r'\bprovincia de santiago del estero\b',
+        r'\bprovincia de tierra del fuego\b',
+        r'\bbelen de escobar\b',
+        r'\bvilla allende\b',
+        r'\bvilla carlos paz\b',
+        r'\bcarlos paz\b',
+        r'\balta gracia\b',
+        r'\bvilla maria\b',
+        r'\brio cuarto\b',
+        r'\bsan francisco cordoba\b'
+    )
+    if any(re.search(patron, direccion) for patron in patrones_fuera):
+        return 'FUERA_DE_ALCANCE'
+
+    # "Córdoba, Argentina" por sí solo no prueba que sea Córdoba Capital.
     if re.search(r'\bcordoba capital\b', direccion):
         return 'CORDOBA_CAPITAL'
     return 'UBICACION_INCIERTA'
@@ -349,26 +385,42 @@ def ejecutar_agente():
     # No se crean contactos, leads ni oportunidades nuevas.
     id_prospectos = 5
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id']
-    # Evita repetir los mismos 50 pendientes todos los días.
-    # Un lead auditado se puede volver a intentar después de 7 días.
-    fecha_reintento = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-    mensajes_recientes = models.execute_kw(
-        ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
-        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:'], ['date', '>=', fecha_reintento]]],
-        {'fields': ['res_id'], 'limit': 10000, 'order': 'id desc'}
-    )
-    ids_aun_revisados = list({m.get('res_id') for m in mensajes_recientes if m.get('res_id')})
+    # Trae todos los leads de etapa 5 y rota por los auditados más antiguos.
+    # Así los pendientes recientes no bloquean indefinidamente a los demás: cada
+    # ejecución toma hasta 50 y los que recibieron una nota nueva pasan al final.
     dominio = [['stage_id', '=', id_prospectos]]
-    if ids_aun_revisados:
-        dominio.append(['id', 'not in', ids_aun_revisados])
-    leads = models.execute_kw(
+    todos_los_leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
         [dominio],
-        {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'id asc'}
+        {'fields': campos, 'limit': 10000, 'order': 'id asc'}
     )
+    mensajes_agente = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
+        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:']]],
+        {'fields': ['res_id', 'date'], 'limit': 20000, 'order': 'date desc'}
+    )
+
+    ultima_auditoria = {}
+    for mensaje in mensajes_agente:
+        res_id = mensaje.get('res_id')
+        fecha = mensaje.get('date') or ''
+        if res_id and (res_id not in ultima_auditoria or fecha > ultima_auditoria[res_id]):
+            ultima_auditoria[res_id] = fecha
+
+    # Sin auditoría previa primero; luego los auditados hace más tiempo.
+    todos_los_leads.sort(
+        key=lambda lead: (
+            ultima_auditoria.get(lead['id'], ''),
+            lead['id']
+        )
+    )
+    leads = todos_los_leads[:MAX_LEADS_POR_EJECUCION]
+    con_auditoria_previa = sum(1 for lead in todos_los_leads if lead['id'] in ultima_auditoria)
     print(
         f"Auditoria de leads EXISTENTES en Prospectos por Controlar (etapa {id_prospectos}). "
-        f"Encontrados: {len(leads)} | Maximo por ejecucion: {MAX_LEADS_POR_EJECUCION}. "
+        f"Total en etapa: {len(todos_los_leads)} | Con auditoria previa: {con_auditoria_previa} "
+        f"| Sin auditoria previa: {len(todos_los_leads) - con_auditoria_previa} "
+        f"| Lote seleccionado: {len(leads)} | Maximo por ejecucion: {MAX_LEADS_POR_EJECUCION}. "
         f"Modelo: {MODELO_GEMINI}.",
         flush=True
     )
