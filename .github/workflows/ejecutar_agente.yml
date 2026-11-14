@@ -2,11 +2,10 @@ name: Agente Verificador de Leads Odoo
 
 on:
   schedule:
-    # Una ejecución diaria, después de la ventana habitual del buscador de leads.
+    # 21:00 hora de Argentina.
     - cron: '0 0 * * *'
-  workflow_dispatch: # Permite ejecución manual controlada.
+  workflow_dispatch:
 
-# Evita dos verificaciones simultáneas que dupliquen consumo de Gemini.
 concurrency:
   group: verificador-leads-odoo
   cancel-in-progress: false
@@ -16,22 +15,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Descargar código del repositorio
+      - name: Descargar codigo del repositorio
         uses: actions/checkout@v4
-
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
-
-      - name: Ejecutar Agente de Leads
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+      - name: Ejecutar agente revisor
         env:
           ODOO_URL: ${{ secrets.ODOO_URL }}
           ODOO_DB: ${{ secrets.ODOO_DB }}
           ODOO_USER: ${{ secrets.ODOO_USER }}
           ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python agente_leads.py
