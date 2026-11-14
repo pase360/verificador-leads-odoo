@@ -72,7 +72,7 @@ def normalizar_texto(valor):
     valor = (valor or '').lower()
     valor = valor.replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u')
     valor = re.sub(r'[^a-z0-9]+', ' ', valor)
-    return re.sub(r'\\s+', ' ', valor).strip()
+    return re.sub(r'\s+', ' ', valor).strip()
 
 
 def clasificar_alcance_geografico(lead):
@@ -106,7 +106,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
 
     # La dirección debe incluir calle y número; no alcanza con ciudad o barrio.
     partes_direccion = direccion.split()
-    if len(partes_direccion) < 2 or not any(re.search(r'\\d', p) for p in partes_direccion):
+    if len(partes_direccion) < 2 or not any(re.search(r'\d', p) for p in partes_direccion):
         return False, False, False
 
     nombre_ok = False
@@ -115,7 +115,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
     telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
     email_ia = (resultado.email_elegido or '').strip().lower()
 
-    for bloque in re.split(r'(?=\\n=== FUENTE INDIVIDUAL ===)', evidencia):
+    for bloque in re.split(r'(?=\n=== FUENTE INDIVIDUAL ===)', evidencia):
         bloque_n = normalizar_texto(bloque)
         # El nombre completo debe figurar en la misma fuente que la dirección.
         if nombre not in bloque_n or direccion not in bloque_n:
@@ -125,7 +125,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
         # El teléfono sugerido por Gemini debe aparecer literalmente, con formato
         # variable, en esa misma fuente. No basta con que aparezca en otro resultado.
         if telefono_ia:
-            candidatos = re.findall(r'\\+?\\d[\\d\\s().-]{6,}\\d', bloque)
+            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{6,8}(?!\d)', bloque)
             for candidato in candidatos:
                 if limpiar_formato_celular(candidato) == telefono_ia:
                     telefono_ok = True
@@ -225,7 +225,7 @@ def investigacion_profunda_con_google_search(lead):
     snippets1 = []
     for item in res1:
         link = item.get('href', '')
-        snippets1.append(f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {item.get('title')}\\nTexto: {item.get('body')}\\nURL: {link}")
+        snippets1.append(f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {item.get('title')}\nTexto: {item.get('body')}\nURL: {link}")
         if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
             urls_encontradas.append(link)
     if snippets1:
@@ -236,7 +236,7 @@ def investigacion_profunda_con_google_search(lead):
     print(f"-> Buscando en Facebook/Instagram: {q2}", flush=True)
     res2 = ejecutar_consulta_ddgs(q2, max_res=6)
     if res2:
-        snippets2 = [f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {i.get('title')}\\nTexto: {i.get('body')}\\nURL: {i.get('href')}" for i in res2]
+        snippets2 = [f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {i.get('title')}\nTexto: {i.get('body')}\nURL: {i.get('href')}" for i in res2]
         reporte_total.append("=== RESULTADOS DE FACEBOOK E INSTAGRAM ===\n" + "\n".join(snippets2))
     time.sleep(1)
 
@@ -244,7 +244,7 @@ def investigacion_profunda_con_google_search(lead):
     print(f"-> Rastreando correos electrónicos: {q3}", flush=True)
     res3 = ejecutar_consulta_ddgs(q3, max_res=5)
     if res3:
-        snippets3 = [f"\\n=== FUENTE INDIVIDUAL ===\\nTítulo: {i.get('title')}\\nTexto: {i.get('body')}\\nURL: {i.get('href')}" for i in res3]
+        snippets3 = [f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {i.get('title')}\nTexto: {i.get('body')}\nURL: {i.get('href')}" for i in res3]
         reporte_total.append("=== RASTREO DE EMAILS ===\n" + "\n".join(snippets3))
     time.sleep(1)
 
@@ -256,7 +256,7 @@ def investigacion_profunda_con_google_search(lead):
         print(f"-> Entrando a web oficial: {url}", flush=True)
         contenido = extraer_texto_de_url(url)
         if contenido:
-            reporte_total.append(f"=== CONTENIDO WEB ({url}) ===\n{contenido}")
+            reporte_total.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
         time.sleep(1)
 
     evidencia = "\n\n".join(reporte_total).strip()
