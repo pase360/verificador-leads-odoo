@@ -67,11 +67,12 @@ def conectar_odoo():
     return uid, models
 
 def es_cordoba_capital(lead):
+    # La ciudad de Odoo puede estar vacía aunque la dirección esté completa.
+    # La pertenencia a Córdoba Capital se valida con evidencia durante la auditoría,
+    # no se descarta automáticamente por un campo city vacío.
     ciudad = (lead.get('city') or '').strip().lower()
     ciudad = (ciudad.replace('á', 'a').replace('é', 'e')
                    .replace('í', 'i').replace('ó', 'o').replace('ú', 'u'))
-    # Sin ciudad explícita no se presume que una dirección de la provincia
-    # pertenezca a Córdoba Capital.
     return ciudad in ('cordoba', 'cordoba capital', 'capital')
 
 
@@ -151,7 +152,7 @@ def investigacion_profunda_con_google_search(lead):
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
     direccion = lead.get('street') or ''
-    ciudad = lead.get('city') or 'Cordoba Argentina'
+    ciudad = lead.get('city') or 'Córdoba Capital (verificar con la dirección; no asumir)'
     calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
     
     reporte_total = []
@@ -212,7 +213,8 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
 
     DATOS EN ODOO:
     - Nombre en Odoo: {nombre_original} (Nombre corto en redes: {nombre_corto})
-    - Dirección exacta: {direccion}, {ciudad}
+    - Dirección exacta cargada en Odoo: {direccion}
+    - Ciudad cargada en Odoo: {ciudad}
     - Email actual en Odoo: {email_actual}
     - Teléfono actual en Odoo: {telefono_actual}
 
@@ -226,6 +228,7 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
        - No completes datos por intuición ni por similitud de nombres.
     2. IDENTIDAD, UBICACIÓN Y RUBRO:
        - Confirma que el nombre corresponde al comercio buscado y que la dirección/sucursal coincide con la dirección exacta de Odoo.
+       - ALCANCE GEOGRÁFICO OBLIGATORIO: solo aprobar direcciones ubicadas dentro de Córdoba Capital, Córdoba, Argentina. La ciudad de Odoo puede estar vacía; en ese caso determina la localidad usando la dirección completa, código postal y evidencia de las fuentes. No confundas Córdoba Capital con localidades cercanas (por ejemplo Saldán, Villa Allende, La Calera, Carlos Paz, Villa María) ni con otras provincias. Si no puedes confirmar que está dentro del ejido de Córdoba Capital, coincide_ubicacion_y_rubro=FALSE.
        - Confirma que el rubro es compatible con el comercio. No uses datos de otra sucursal, otra ciudad, otro negocio homónimo ni de la marca en general si no se puede vincular al local.
        - Si no puedes confirmar comercio, dirección y rubro con evidencia concreta, coincide_ubicacion_y_rubro=FALSE y no apruebes.
     3. TELÉFONO OBLIGATORIO:
@@ -278,17 +281,7 @@ def ejecutar_agente():
     # Los aprobados salen de Prospectos al pasar a la etapa verificada.
     # Los pendientes se vuelven a revisar en lotes controlados para que un
     # error temporal o una auditoría sin email no los deje bloqueados.
-    mensajes_fuera = models.execute_kw(
-        ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
-        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Fuera de alcance: Córdoba Capital']]],
-        {'fields': ['res_id'], 'limit': 10000, 'order': 'id desc'}
-    )
-    ids_fuera_alcance = {m.get('res_id') for m in mensajes_fuera if m.get('res_id')}
-
     dominio_nuevos = [['stage_id', '=', id_prospectos], ['create_date', '>=', fecha_corte]]
-    if ids_fuera_alcance:
-        dominio_nuevos.append(['id', 'not in', list(ids_fuera_alcance)])
-
     nuevos = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
         [dominio_nuevos],
@@ -300,8 +293,6 @@ def ejecutar_agente():
         ['stage_id', '=', id_prospectos],
         ['create_date', '<', fecha_corte]
     ]
-    if ids_fuera_alcance:
-        dominio_atrasados.append(['id', 'not in', list(ids_fuera_alcance)])
     if ids_nuevos:
         dominio_atrasados.append(['id', 'not in', ids_nuevos])
 
@@ -324,13 +315,6 @@ def ejecutar_agente():
 
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
-
-        if not es_cordoba_capital(lead):
-            nota_fuera = "Fuera de alcance: Córdoba Capital. No se audita porque el campo ciudad de Odoo no confirma Córdoba Capital."
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [lead['id']], {'body': nota_fuera})
-            print(f"Fuera de alcance: ciudad Odoo='{lead.get('city') or 'vacía'}'.", flush=True)
-            procesados += 1
-            continue
 
         info_ddgs = investigacion_profunda_con_google_search(lead)
 
