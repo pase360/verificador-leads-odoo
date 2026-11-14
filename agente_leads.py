@@ -242,10 +242,23 @@ def investigar_lead(contexto, lead):
             fuente_identidad_direccion = True
             break
 
+    # Solo se toman telefonos y correos de dominios cuyo contenido identifica al comercio.
+    dominios_del_comercio = set()
+    for url, texto in paginas:
+        t = normalizar(texto)
+        coincidencias_nombre = sum(x in t for x in palabras_nombre)
+        if palabras_nombre and coincidencias_nombre >= max(1, min(2, len(palabras_nombre))):
+            host = urlparse(url).netloc.lower().replace('www.', '')
+            if host:
+                dominios_del_comercio.add(host)
+
     telefonos_paginas = []
     telefonos_whatsapp = []
     emails = []
-    for _, texto in paginas:
+    for url, texto in paginas:
+        host = urlparse(url).netloc.lower().replace('www.', '')
+        if host not in dominios_del_comercio:
+            continue
         telefonos_paginas.extend(extraer_telefonos(texto))
         emails.extend(extraer_emails(texto))
         for coincidencia in re.findall(
@@ -272,10 +285,22 @@ def investigar_lead(contexto, lead):
         telefono_verificado = False
 
     email_elegido = emails[0] if emails else ''
-    aprobado = fuente_identidad_direccion and telefono_verificado
+    ciudad_odo = normalizar(lead.get('city'))
+    localidades_excluidas = (
+        'villa allende', 'saldan', 'la calera', 'villa carlos paz',
+        'carlos paz', 'alta gracia', 'villa maria', 'san francisco',
+        'rio cuarto', 'rio tercero', 'jesus maria', 'cosquin'
+    )
+    ciudad_odo_ok = (
+        (not ciudad_odo or 'cordoba' in ciudad_odo or 'capital' in ciudad_odo)
+        and not any(localidad in ciudad_odo for localidad in localidades_excluidas)
+    )
+    aprobado = fuente_identidad_direccion and ciudad_odo_ok and telefono_verificado
     faltantes = []
     if not fuente_identidad_direccion:
         faltantes.append('no se confirmaron juntos nombre, direccion y Cordoba en una misma fuente')
+    if not ciudad_odo_ok:
+        faltantes.append('la ciudad cargada en Odoo esta fuera de Cordoba Capital')
     if not telefono_verificado:
         faltantes.append('no se verifico el telefono de Odoo ni un WhatsApp publicado')
     motivo = (
