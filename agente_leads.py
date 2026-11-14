@@ -469,16 +469,24 @@ def ejecutar_agente():
             resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
         except BusquedaSinEvidencia as e:
             fallas_busqueda += 1
+            nota_error = f"Agente de Verificación: PENDIENTE. No se modificó el lead porque la búsqueda no devolvió evidencia suficiente: {e}"
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
             print(f"BUSQUEDA SIN EVIDENCIA. No se modifica el lead y queda pendiente: {e}", flush=True)
             continue
         except CuotaGeminiAgotada as e:
+            nota_error = f"Agente de Verificación: PENDIENTE. Ejecución detenida por límite de cuota de Gemini; no se modificaron los datos: {e}"
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
             print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
             break
         except ServicioGeminiTemporal as e:
             no_auditados += 1
+            nota_error = f"Agente de Verificación: PENDIENTE. Gemini no estuvo disponible; no se modificaron los datos: {e}"
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
             print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}", flush=True)
             break
         except Exception as e:
+            nota_error = f"Agente de Verificación: PENDIENTE. Error durante la auditoría; no se modificaron los datos: {e}"
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
             print(f"Error de Gemini en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
             pendientes += 1
             continue
