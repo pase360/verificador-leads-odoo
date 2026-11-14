@@ -185,12 +185,9 @@ def clasificar_alcance_geografico(lead):
         'cordoba argentina', 'cordoba cordoba argentina',
         'cordoba capital argentina', 'cordoba capital cordoba argentina'
     }
-    if ciudad in ciudades_capital:
-        # La ciudad declarada en Odoo no reemplaza la verificación de calle y altura.
-        # Se continúa con Georef para confirmar que la dirección pertenece a Capital.
-        pass
-    if ciudad:
+    if ciudad and ciudad not in ciudades_capital:
         return 'FUERA_DE_ALCANCE'
+    # Si city está vacío o indica Córdoba Capital, Georef debe confirmar calle y altura.
 
     # Si la dirección identifica expresamente otra provincia o localidad, no consultar
     # el geocodificador para intentar reinterpretarla.
@@ -253,32 +250,54 @@ def clasificar_alcance_geografico(lead):
     return alcance
 
 def evidencia_confirma_sucursal(lead, evidencia, resultado):
-    """Solo acepta datos si nombre + calle/número + teléfono aparecen en la misma fuente."""
+    """Valida nombre + calle/altura + al menos un contacto en una misma fuente."""
     nombre = normalizar_texto(lead.get('partner_name') or lead.get('name') or '')
-    direccion = normalizar_texto(lead.get('street') or '')
-    if not nombre or not direccion:
+    direccion = str(lead.get('street') or '').split(',')[0].strip()
+    direccion_n = normalizar_texto(direccion)
+    if not nombre or not direccion_n:
         return False, False, False
 
-    # La dirección debe incluir calle y número; no alcanza con ciudad o barrio.
-    partes_direccion = direccion.split()
-    if len(partes_direccion) < 2 or not any(re.search(r'\d', p) for p in partes_direccion):
+    # Exigir calle y altura, pero no CP/localidad/país: muchas fuentes publican solo calle y número.
+    tokens = direccion_n.split()
+    numeros = re.findall(r'\d+', direccion_n)
+    if not numeros or len(tokens) < 2:
         return False, False, False
+    altura = numeros[-1]
+    calle_tokens = [t for t in tokens if not t.isdigit()]
+    calle_clave = " ".join(calle_tokens)
+    # Normalizar abreviaturas frecuentes sin aceptar coincidencias por altura aislada.
+    calle_clave = re.sub(r'\b(av|avenida)\b', 'avenida', calle_clave)
+    calle_clave = re.sub(r'\b(bv|boulevard)\b', 'boulevard', calle_clave)
 
-    nombre_ok = False
-    telefono_ok = False
-    email_ok = False
+    nombre_ok = telefono_ok = email_ok = False
     telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
     email_ia = (resultado.email_elegido or '').strip().lower()
 
     for bloque in re.split(r'(?=\n=== FUENTE INDIVIDUAL ===)', evidencia):
         bloque_n = normalizar_texto(bloque)
-        # El nombre completo debe figurar en la misma fuente que la dirección.
-        if nombre not in bloque_n or direccion not in bloque_n:
+        if nombre not in bloque_n:
+            # Permitir nombre corto solo si tiene al menos dos palabras significativas.
+            nombre_corto = normalizar_texto(limpiar_nombre_busqueda(lead.get('partner_name') or lead.get('name') or ''))
+            if len(nombre_corto.split()) < 2 or nombre_corto not in bloque_n:
+                continue
+
+        # La misma fuente debe contener la calle y altura de la sucursal.
+        if altura not in re.findall(r'\d+', bloque_n):
+            continue
+        calle_norm_bloque = re.sub(r'\b(av|avenida)\b', 'avenida', bloque_n)
+        calle_norm_bloque = re.sub(r'\b(bv|boulevard)\b', 'boulevard', calle_norm_bloque)
+        if not calle_clave or not all(t in calle_norm_bloque.split() for t in calle_clave.split()):
             continue
         nombre_ok = True
 
-        # El teléfono sugerido por Gemini debe aparecer literalmente, con formato
-        # variable, en esa misma fuente. No basta con que aparezca en otro resultado.
+        # Correo: tomar el elegido por Gemini solo si aparece literalmente en esta fuente.
+        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', bloque)
+        emails = [e.lower().strip('.,;:()[]{}<>') for e in emails]
+        emails = [e for e in emails if not any(x in e for x in ('example.com','sentry.io','wixpress.com'))]
+        if email_ia and email_ia in emails:
+            email_ok = True
+
+        # Teléfono: comparar el elegido por Gemini con números publicados en esa misma fuente.
         if telefono_ia:
             candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)', bloque)
             for candidato in candidatos:
@@ -286,12 +305,7 @@ def evidencia_confirma_sucursal(lead, evidencia, resultado):
                     telefono_ok = True
                     break
 
-        if email_ia and email_ia in bloque.lower():
-            email_ok = True
-
     return nombre_ok, telefono_ok, email_ok
-
-
 def limpiar_nombre_busqueda(nombre):
     palabras_rubro = [
         r'\bdiet[eé]tica\b', r'\bverduler[ií]a\b', r'\bferreter[ií]a\b',
@@ -331,36 +345,47 @@ def limpiar_formato_celular(numero):
     return f"+{solo_digitos}" if str(numero).strip().startswith("+") else solo_digitos
 
 def extraer_texto_de_url(url):
+    """Descarga una página y extrae contenido, emails, WhatsApp y enlaces internos de contacto."""
     if not url or not url.startswith("http"):
         return ""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
             'Accept-Language': 'es-AR,es;q=0.9'
         }
-        response = requests.get(url, headers=headers, timeout=12)
-        if response.status_code == 200:
-            texto = response.text
-            whatsapp_links = re.findall(r'(?:wa\.me/|whatsapp\.com/send\?phone=|whatsapp://send\?phone=)([0-9+\s-]+)', texto, re.IGNORECASE)
-            whatsapp_limpios = [re.sub(r'\D', '', w) for w in whatsapp_links if len(re.sub(r'\D', '', w)) >= 8]
-            emails_html = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', texto)
-            emails_filtrados = list(set([e.lower() for e in emails_html if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', 'sentry.io', 'wixpress.com', 'example.com'))]))
-            
-            info_extra = ""
-            if whatsapp_limpios:
-                info_extra += f"\n[BOTÓN DE WHATSAPP EN WEB: {', '.join(set(whatsapp_limpios))}]"
-            if emails_filtrados:
-                info_extra += f"\n[CORREOS DETECTADOS EN EL CÓDIGO DE LA WEB: {', '.join(emails_filtrados[:5])}]"
-            
-            texto_limpio = re.sub(r'<script[^>]*>.*?</script>', ' ', texto, flags=re.DOTALL | re.IGNORECASE)
-            texto_limpio = re.sub(r'<style[^>]*>.*?</style>', ' ', texto_limpio, flags=re.DOTALL | re.IGNORECASE)
-            texto_limpio = re.sub(r'<[^>]+>', ' ', texto_limpio)
-            texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
-            return f"{info_extra}\nContenido visible: {texto_limpio[:4000]}"
-    except Exception:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            return ""
+        from urllib.parse import urljoin
+        html = response.text[:1500000]
+        whatsapp_links = re.findall(r'(?:wa\.me/|whatsapp\.com/send\?phone=|whatsapp://send\?phone=)([0-9+\s-]+)', html, re.IGNORECASE)
+        whatsapp_limpios = [re.sub(r'\D', '', w) for w in whatsapp_links if len(re.sub(r'\D', '', w)) >= 8]
+        emails_html = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
+        emails_filtrados = sorted(set(e.lower() for e in emails_html if not e.lower().endswith(('.png','.jpg','.jpeg','.gif','.svg','.webp')) and not any(x in e.lower() for x in ('sentry.io','wixpress.com','example.com'))))
+        enlaces_contacto = []
+        for href, label in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, re.I | re.S):
+            texto_link = re.sub(r'<[^>]+>', ' ', label)
+            if re.search(r'contact|contacto|nosotros|empresa|about|quienes|quiénes|sucursal|local', href + " " + texto_link, re.I):
+                destino = urljoin(url, href.split('#')[0])
+                if destino.startswith("http") and destino not in enlaces_contacto:
+                    enlaces_contacto.append(destino)
+        texto_limpio = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+        texto_limpio = re.sub(r'<style[^>]*>.*?</style>', ' ', texto_limpio, flags=re.DOTALL | re.IGNORECASE)
+        texto_limpio = re.sub(r'<[^>]+>', ' ', texto_limpio)
+        texto_limpio = re.sub(r'&nbsp;|&#160;', ' ', texto_limpio, flags=re.I)
+        texto_limpio = re.sub(r'&amp;', '&', texto_limpio, flags=re.I)
+        texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
+        extras = []
+        if whatsapp_limpios:
+            extras.append("[WHATSAPP PUBLICADO: " + ", ".join(sorted(set(whatsapp_limpios))) + "]")
+        if emails_filtrados:
+            extras.append("[EMAILS PUBLICADOS EN EL HTML: " + ", ".join(emails_filtrados[:15]) + "]")
+        if enlaces_contacto:
+            extras.append("[PÁGINAS INTERNAS DE CONTACTO: " + " | ".join(enlaces_contacto[:12]) + "]")
+        return "\n".join(extras) + "\nContenido visible: " + texto_limpio[:10000]
+    except Exception as exc:
+        print(f"No se pudo leer {url}: {exc}", flush=True)
         return ""
-    return ""
-
 def ejecutar_consulta_ddgs(query, max_res=7):
     try:
         resultados = DDGS().text(query, region="ar-es", max_results=max_res)
@@ -369,60 +394,86 @@ def ejecutar_consulta_ddgs(query, max_res=7):
         return []
 
 def investigacion_profunda_con_google_search(lead):
+    """Busca primero emails: buscador, web oficial, páginas internas y redes públicas."""
+    from urllib.parse import urlparse
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
     direccion = lead.get('street') or ''
-    ciudad = lead.get('city') or 'Córdoba Capital (verificar con la dirección; no asumir)'
     calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
-    
-    reporte_total = []
-    urls_encontradas = []
+    ciudad = lead.get('city') or 'Córdoba Capital, Argentina'
+    base = f'"{nombre_corto}" "{calle_busqueda}" Córdoba Argentina' if calle_busqueda else f'"{nombre_corto}" Córdoba Argentina'
 
-    q1 = f'{nombre_original} {calle_busqueda} {ciudad} contacto whatsapp email'
-    print(f"-> Buscando en web: {q1}", flush=True)
-    res1 = ejecutar_consulta_ddgs(q1, max_res=6)
-    snippets1 = []
-    for item in res1:
-        link = item.get('href', '')
-        snippets1.append(f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {item.get('title')}\nTexto: {item.get('body')}\nURL: {link}")
-        if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
-            urls_encontradas.append(link)
-    if snippets1:
-        reporte_total.append("=== BÚSQUEDA WEB GENERAL ===\n" + "\n".join(snippets1))
-    time.sleep(1)
+    reporte = []
+    resultados_urls = []
+    urls_vistas = set()
+    dominios_no_utiles = (
+        'wikipedia.org','pornhub.com','xvideos.com','youtube.com','tiktok.com',
+        'linkedin.com','tripadvisor.','pedidosya.','rappi.','mercadolibre.',
+        'ubereats.','indeed.','glassdoor.','mapquest.','yelp.','zoominfo.'
+    )
 
-    q2 = f'"{nombre_corto}" {calle_busqueda} {ciudad} (site:facebook.com OR site:instagram.com)' if calle_busqueda else f'"{nombre_corto}" {ciudad} (site:facebook.com OR site:instagram.com)'
-    print(f"-> Buscando en Facebook/Instagram: {q2}", flush=True)
-    res2 = ejecutar_consulta_ddgs(q2, max_res=6)
-    if res2:
-        snippets2 = [f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {i.get('title')}\nTexto: {i.get('body')}\nURL: {i.get('href')}" for i in res2]
-        reporte_total.append("=== RESULTADOS DE FACEBOOK E INSTAGRAM ===\n" + "\n".join(snippets2))
-    time.sleep(1)
+    consultas = [
+        (f'{base} email correo electrónico contacto', 8, "BÚSQUEDA PRIORITARIA DE EMAIL"),
+        (f'{base} mail @gmail.com OR @hotmail.com OR @outlook.com OR @yahoo.com', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
+        (f'"{nombre_corto}" "{calle_busqueda}" contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
+        (f'"{nombre_corto}" Córdoba Facebook Instagram contacto email', 7, "BÚSQUEDA EN REDES SOCIALES"),
+        (f'"{nombre_corto}" "{calle_busqueda}" "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
+    ]
 
-    q3 = f'"{nombre_corto}" {calle_busqueda} ("@gmail.com" OR "@hotmail.com" OR "@yahoo.com")'
-    print(f"-> Rastreando correos electrónicos: {q3}", flush=True)
-    res3 = ejecutar_consulta_ddgs(q3, max_res=5)
-    if res3:
-        snippets3 = [f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {i.get('title')}\nTexto: {i.get('body')}\nURL: {i.get('href')}" for i in res3]
-        reporte_total.append("=== RASTREO DE EMAILS ===\n" + "\n".join(snippets3))
-    time.sleep(1)
-
-    for url in list(set(urls_encontradas)):
-        if "wa.me" in url or "api.whatsapp.com" in url:
-            num_wa = re.sub(r'\D', '', url)
-            reporte_total.append(f"=== ENLACE DIRECTO WHATSAPP ===\nNúmero: {num_wa}")
-            continue
-        print(f"-> Entrando a web oficial: {url}", flush=True)
-        contenido = extraer_texto_de_url(url)
-        if contenido:
-            reporte_total.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
+    for query, limite, etiqueta in consultas:
+        print(f"-> {etiqueta}: {query}", flush=True)
+        resultados = ejecutar_consulta_ddgs(query, max_res=limite)
+        bloques = []
+        for item in resultados:
+            titulo = item.get('title') or ''
+            cuerpo = item.get('body') or ''
+            link = item.get('href') or ''
+            bloques.append(f"\n=== FUENTE INDIVIDUAL ===\nTítulo: {titulo}\nTexto: {cuerpo}\nURL: {link}")
+            if link.startswith("http") and not any(d in urlparse(link).netloc.lower() for d in dominios_no_utiles):
+                if link not in urls_vistas:
+                    urls_vistas.add(link)
+                    resultados_urls.append((link, titulo, cuerpo))
+        if bloques:
+            reporte.append(f"=== {etiqueta} ===\n" + "\n".join(bloques))
         time.sleep(1)
 
-    evidencia = "\n\n".join(reporte_total).strip()
+    # Priorizar sitios propios; los resultados de redes quedan como evidencia de perfil.
+    def puntuacion(item):
+        link, titulo, cuerpo = item
+        dominio = urlparse(link).netloc.lower()
+        puntos = 0
+        if any(x in dominio for x in ('facebook.com','instagram.com')): puntos += 2
+        else: puntos += 5
+        if any(x in (titulo + " " + cuerpo).lower() for x in ('contacto','email','correo','teléfono','telefono')): puntos += 3
+        if calle_busqueda and normalizar_texto(calle_busqueda).split()[0] in normalizar_texto(titulo + " " + cuerpo): puntos += 3
+        if any(d in dominio for d in dominios_no_utiles): puntos -= 20
+        return puntos
+
+    resultados_urls.sort(key=puntuacion, reverse=True)
+    urls_para_abrir = [x[0] for x in resultados_urls[:8]]
+
+    # Descargar páginas halladas y descubrir páginas internas de contacto.
+    pendientes = list(urls_para_abrir)
+    visitadas = set()
+    while pendientes and len(visitadas) < 12:
+        url = pendientes.pop(0)
+        if url in visitadas:
+            continue
+        visitadas.add(url)
+        print(f"-> Leyendo página para encontrar email/contacto: {url}", flush=True)
+        contenido = extraer_texto_de_url(url)
+        if contenido:
+            reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
+            for enlace in re.findall(r'https?://[^\s|]+', contenido):
+                if any(k in enlace.lower() for k in ('contact','contacto','nosotros','about','empresa')):
+                    if enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
+                        pendientes.insert(0, enlace)
+        time.sleep(0.7)
+
+    evidencia = "\n\n".join(reporte).strip()
     if not evidencia:
         raise BusquedaSinEvidencia("DuckDuckGo no entregó resultados ni páginas verificables.")
     return evidencia
-
 def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
@@ -432,45 +483,32 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     telefono_actual = lead.get('phone') or 'VACÍO'
 
     prompt = f"""
-    Eres un investigador experto en empresas y comercios de Argentina. Usa los resultados de DuckDuckGo y las páginas web obtenidas previamente para encontrar el EMAIL y el TELÉFONO/WHATSAPP reales de este comercio.
+    Eres un investigador exhaustivo de comercios de Argentina. Tu prioridad número uno es encontrar y verificar el EMAIL público del comercio. No te conformes con el primer resultado ni abandones la búsqueda de email porque hayas encontrado un teléfono.
 
     DATOS EN ODOO:
-    - Nombre en Odoo: {nombre_original} (Nombre corto en redes: {nombre_corto})
-    - Dirección exacta cargada en Odoo: {direccion}
-    - Código postal cargado en Odoo: {lead.get('zip') or 'No informado'}
-    - Ciudad cargada en Odoo: {ciudad}
-    - Email actual en Odoo: {email_actual}
-    - Teléfono actual en Odoo: {telefono_actual}
+    - Nombre: {nombre_original} (nombre corto: {nombre_corto})
+    - Dirección de la sucursal: {direccion}
+    - Ciudad: {ciudad}
+    - Email actual: {email_actual}
+    - Teléfono actual: {telefono_actual}
 
-    RESULTADOS PREVIOS DE RASTREO:
+    EVIDENCIA REUNIDA (resultados de búsqueda, HTML de webs y páginas internas):
     {info_duckduckgo}
 
-    INSTRUCCIONES OBLIGATORIAS DE BÚSQUEDA Y VALIDACIÓN:
-    1. USA ÚNICAMENTE LA EVIDENCIA INCLUIDA:
-       - Usa solo los resultados de DuckDuckGo y el contenido de páginas efectivamente descargadas.
-       - No afirmes haber consultado fuentes que no aparecen en la evidencia.
-       - No completes datos por intuición ni por similitud de nombres.
-    2. IDENTIDAD, UBICACIÓN Y RUBRO:
-       - Confirma que el nombre corresponde al comercio buscado y que la dirección/sucursal coincide con la dirección exacta de Odoo.
-       - ALCANCE GEOGRÁFICO OBLIGATORIO: solo aprobar direcciones ubicadas dentro de Córdoba Capital, Córdoba, Argentina. La ciudad de Odoo puede estar vacía; en ese caso determina la localidad usando la dirección completa, código postal y evidencia de las fuentes. No confundas Córdoba Capital con localidades cercanas (por ejemplo Saldán, Villa Allende, La Calera, Carlos Paz, Villa María) ni con otras provincias. Si no puedes confirmar que está dentro del ejido de Córdoba Capital, coincide_ubicacion_y_rubro=FALSE.
-       - Confirma que el rubro es compatible con el comercio. No uses datos de otra sucursal, otra ciudad, otro negocio homónimo ni de la marca en general si no se puede vincular al local.
-       - Si no puedes confirmar comercio, dirección y rubro con evidencia concreta, coincide_ubicacion_y_rubro=FALSE y no apruebes.
-    3. TELÉFONO OBLIGATORIO:
-       - telefono_verificado=TRUE solo si el número aparece literalmente en una fuente pública confiable y se puede vincular a este comercio/sucursal.
-       - Si el teléfono oficial encontrado difiere del de Odoo, devuelve el oficial normalizado con +549 cuando corresponda.
-       - Prioriza WhatsApp o móvil si hay varios. Nunca valides un teléfono solo porque figura en Odoo.
-    4. EMAIL OPCIONAL:
-       - El email NO es requisito para aprobar.
-       - Si encuentras un correo publicado literalmente y vinculado a este comercio/sucursal, devuelve email_elegido y email_verificado=TRUE.
-       - Si no encuentras email confiable, devuelve email_elegido="" y email_verificado=FALSE. Esto NO debe impedir la aprobación.
-       - Nunca inventes ni atribuyas emails de negocios homónimos, otras sucursales o empresas de otra ciudad.
-    5. RESULTADO:
-       - datos_validos_y_verificados=TRUE si y solo si la identidad del comercio, la dirección exacta/sucursal, el rubro y el teléfono están confirmados.
-       - No exijas email para datos_validos_y_verificados.
-       - Nunca marques como verificado un dato solo porque ya estaba cargado en Odoo.
+    REGLAS:
+    1. EMAIL: revisa todos los resultados y especialmente las secciones [EMAILS PUBLICADOS EN EL HTML], páginas de Contacto, Nosotros, pie de página y perfiles públicos de Facebook/Instagram. Si aparece un email que pertenece inequívocamente al comercio o a la sucursal, devuelve email_elegido exactamente y email_verificado=TRUE. No uses correos técnicos, de plataformas, de terceros ni de negocios homónimos.
+    2. No marques email como no encontrado si la evidencia contiene un correo público claramente vinculado al comercio. El email es prioritario y debe buscarse aunque ya exista teléfono.
+    3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo usa un teléfono publicado y vinculado a la misma sucursal.
+    4. IDENTIDAD: el nombre y la calle/altura deben corresponder a este comercio y esta sucursal. No confundas sucursales, homónimos, marcas o localidades.
+    5. UBICACIÓN: solo Córdoba Capital, Córdoba, Argentina. Georef ya realiza la validación geográfica; no infieras la ubicación por el nombre de la ciudad.
+    6. RUBRO: debe ser compatible con el comercio de Odoo.
+    7. Nunca inventes ni completes datos por intuición. Usa únicamente la evidencia incluida.
+    8. coincide_ubicacion_y_rubro y datos_validos_y_verificados deben ser TRUE solo si identidad, sucursal/dirección y rubro están respaldados por evidencia concreta.
+    9. email_verificado y telefono_verificado son independientes. Devuelve ambos si hay evidencia. No es obligatorio encontrar los dos.
+    10. Si no hay email fiable, devuelve email_elegido="" y email_verificado=FALSE. Si no hay teléfono fiable, devuelve telefono_elegido="" y telefono_verificado=FALSE.
+    11. El motivo debe explicar qué email fue encontrado y en qué tipo de fuente, o qué impidió encontrarlo.
     """
 
-    # Una sola llamada por lead: toda la evidencia ya fue reunida por DuckDuckGo y la lectura de webs.
     response = generar_con_gemini(
         model=MODELO_GEMINI,
         contents=prompt,
@@ -481,7 +519,6 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
         ),
     )
     return response.parsed
-
 def ejecutar_agente():
     print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
@@ -610,30 +647,33 @@ def ejecutar_agente():
         telefono_verificado = bool(
             resultado.telefono_verificado and telefono_formateado and evidencia_telefono
         )
-        identidad_sucursal_verificada = bool(evidencia_nombre_direccion and evidencia_telefono)
+        email_verificado = bool(
+            resultado.email_verificado and email_final and evidencia_email
+        )
+        contacto_verificado = bool(telefono_verificado or email_verificado)
+        identidad_sucursal_verificada = bool(evidencia_nombre_direccion and contacto_verificado)
         aprobado_final = bool(
             alcance == 'CORDOBA_CAPITAL' and
             resultado.coincide_ubicacion_y_rubro and
             resultado.datos_validos_y_verificados and
             identidad_sucursal_verificada and
-            telefono_verificado
+            contacto_verificado
         )
 
         if aprobado_final:
             motivo_ajustado = resultado.motivo
         else:
             faltantes = []
-            if not telefono_verificado:
-                faltantes.append("teléfono no confirmado")
+            if not contacto_verificado:
+                faltantes.append("no se confirmó email ni teléfono público en la misma fuente que identifica la sucursal")
             if not resultado.coincide_ubicacion_y_rubro or not evidencia_nombre_direccion:
-                faltantes.append("nombre y dirección exacta no demostrados en una misma fuente")
-            if not evidencia_telefono:
-                faltantes.append("teléfono no vinculado públicamente a esa sucursal")
+                faltantes.append("nombre y calle/altura no demostrados en una misma fuente")
             motivo_ajustado = f"{resultado.motivo} [NO APROBADO: {', '.join(faltantes) or 'validación insuficiente'}]."
 
         print(
-            f"Resultado: Aprobado={aprobado_final} | Email verificado={resultado.email_verificado} "
-            f"| Teléfono verificado={resultado.telefono_verificado} "
+            f"Resultado: Aprobado={aprobado_final} | Email IA={resultado.email_verificado} "
+            f"| Email evidencia={evidencia_email} | Teléfono IA={resultado.telefono_verificado} "
+            f"| Teléfono evidencia={evidencia_telefono} | Contacto confirmado={contacto_verificado} "
             f"| Tel={telefono_definitivo} | Email={email_definitivo}",
             flush=True
         )
