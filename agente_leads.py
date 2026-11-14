@@ -75,6 +75,78 @@ def normalizar_texto(valor):
     return re.sub(r'\s+', ' ', valor).strip()
 
 
+def extraer_codigos_postales(lead):
+    """Extrae CP tradicional (X5000) o CPA completo (X5019EHE) del lead."""
+    textos = [str(lead.get('zip') or ''), str(lead.get('street') or '')]
+    encontrados = []
+    for texto in textos:
+        encontrados.extend(re.findall(r'(?<![A-Z0-9])([A-Z]\\d{4}[A-Z]{3}|[A-Z]\\d{4})(?![A-Z0-9])', texto.upper()))
+    return list(dict.fromkeys(encontrados))
+
+
+def consultar_georef_direccion(lead, codigo_postal):
+    """
+    Consulta la API oficial Georef con la dirección completa.
+    El código postal se conserva en el texto enviado para mejorar la identificación.
+    No se fuerza el departamento Capital: se comprueba el resultado real para evitar
+    convertir por error una dirección de otra localidad en Córdoba Capital.
+    """
+    direccion = str(lead.get('street') or '').strip()
+    if not direccion:
+        return 'UBICACION_INCIERTA', 'No hay dirección para georreferenciar'
+
+    if codigo_postal and codigo_postal.lower() not in direccion.lower():
+        direccion_consulta = f"{direccion}, {codigo_postal}"
+    else:
+        direccion_consulta = direccion
+
+    try:
+        respuesta = requests.get(
+            "https://apis.datos.gob.ar/georef/api/v2.0/direcciones",
+            params={
+                "direccion": direccion_consulta,
+                "provincia": "cordoba",
+                "max": 5
+            },
+            headers={"User-Agent": "Pase360-VerificadorLeads/1.0"},
+            timeout=12
+        )
+        respuesta.raise_for_status()
+        datos = respuesta.json()
+    except Exception as exc:
+        return 'UBICACION_INCIERTA', f"No se pudo consultar Georef: {exc}"
+
+    resultados = datos.get('direcciones') or []
+    if len(resultados) != 1:
+        return 'UBICACION_INCIERTA', f"Georef devolvió {len(resultados)} coincidencias; no hay identificación única"
+
+    item = resultados[0]
+    provincia_item = normalizar_texto((item.get('provincia') or {}).get('nombre') or '')
+    departamento_item = normalizar_texto((item.get('departamento') or {}).get('nombre') or '')
+    localidad_item = normalizar_texto(
+        (item.get('localidad_censal') or {}).get('nombre') or
+        (item.get('localidad') or {}).get('nombre') or ''
+    )
+
+    if provincia_item and provincia_item != 'cordoba':
+        return 'FUERA_DE_ALCANCE', f"Georef ubica la dirección en {provincia_item}"
+
+    # En Córdoba, el departamento Capital identifica la jurisdicción de la ciudad.
+    # Si la API no devuelve departamento, no se aprueba por el mero prefijo X5.
+    if departamento_item == 'capital' and provincia_item == 'cordoba':
+        if localidad_item and localidad_item not in ('cordoba', 'cordoba capital'):
+            return 'UBICACION_INCIERTA', f"Georef devolvió localidad no coincidente: {localidad_item}"
+        return 'CORDOBA_CAPITAL', (
+            f"Georef confirmó Córdoba, departamento Capital"
+            + (f", localidad {localidad_item}" if localidad_item else "")
+        )
+
+    if provincia_item == 'cordoba' and departamento_item:
+        return 'FUERA_DE_ALCANCE', f"Georef ubica la dirección en departamento {departamento_item}"
+
+    return 'UBICACION_INCIERTA', "Georef no confirmó el departamento Capital"
+
+
 def clasificar_alcance_geografico(lead):
     """Devuelve CORDOBA_CAPITAL, FUERA_DE_ALCANCE o UBICACION_INCIERTA."""
     ciudad = normalizar_texto(lead.get('city') or '')
@@ -87,13 +159,9 @@ def clasificar_alcance_geografico(lead):
     if pais_nombre and pais_nombre not in ('argentina',):
         return 'FUERA_DE_ALCANCE'
 
-    provincias_cordoba = ('cordoba', 'cordoba capital')
-    if provincia_nombre and provincia_nombre not in provincias_cordoba:
+    if provincia_nombre and provincia_nombre not in ('cordoba', 'cordoba capital'):
         return 'FUERA_DE_ALCANCE'
 
-    # Odoo puede guardar la localidad con la provincia repetida o el país agregado.
-    # Solo aceptamos variantes inequívocas de Córdoba Capital; cualquier otra ciudad
-    # de la provincia (Villa Allende, Villa del Rosario, Carlos Paz, etc.) queda fuera.
     ciudades_capital = {
         'cordoba', 'cordoba capital', 'capital',
         'cordoba cordoba', 'cordoba capital cordoba',
@@ -105,48 +173,65 @@ def clasificar_alcance_geografico(lead):
     if ciudad:
         return 'FUERA_DE_ALCANCE'
 
-    # Si city está vacío, detectar primero provincias/localidades explícitamente ajenas.
-    # Esto evita dejar como incierto un domicilio que dice, por ejemplo, Provincia de Buenos Aires.
+    # Si la dirección identifica expresamente otra provincia o localidad, no consultar
+    # el geocodificador para intentar reinterpretarla.
     patrones_fuera = (
-        r'\bprovincia de buenos aires\b',
-        r'\bprovincia de santa fe\b',
-        r'\bprovincia de entre rios\b',
-        r'\bprovincia de san luis\b',
-        r'\bprovincia de la pampa\b',
-        r'\bprovincia de tucuman\b',
-        r'\bprovincia de salta\b',
-        r'\bprovincia de mendoza\b',
-        r'\bprovincia de neuquen\b',
-        r'\bprovincia de rio negro\b',
-        r'\bprovincia de chubut\b',
-        r'\bprovincia de santa cruz\b',
-        r'\bprovincia de misiones\b',
-        r'\bprovincia de corrientes\b',
-        r'\bprovincia de chaco\b',
-        r'\bprovincia de formosa\b',
-        r'\bprovincia de jujuy\b',
-        r'\bprovincia de catamarca\b',
-        r'\bprovincia de la rioja\b',
-        r'\bprovincia de san juan\b',
-        r'\bprovincia de santiago del estero\b',
-        r'\bprovincia de tierra del fuego\b',
-        r'\bbelen de escobar\b',
-        r'\bvilla allende\b',
-        r'\bvilla carlos paz\b',
-        r'\bcarlos paz\b',
-        r'\balta gracia\b',
-        r'\bvilla maria\b',
-        r'\brio cuarto\b',
-        r'\bsan francisco cordoba\b'
+        r'\\bprovincia de buenos aires\\b',
+        r'\\bprovincia de santa fe\\b',
+        r'\\bprovincia de entre rios\\b',
+        r'\\bprovincia de san luis\\b',
+        r'\\bprovincia de la pampa\\b',
+        r'\\bprovincia de tucuman\\b',
+        r'\\bprovincia de salta\\b',
+        r'\\bprovincia de mendoza\\b',
+        r'\\bprovincia de neuquen\\b',
+        r'\\bprovincia de rio negro\\b',
+        r'\\bprovincia de chubut\\b',
+        r'\\bprovincia de santa cruz\\b',
+        r'\\bprovincia de misiones\\b',
+        r'\\bprovincia de corrientes\\b',
+        r'\\bprovincia de chaco\\b',
+        r'\\bprovincia de formosa\\b',
+        r'\\bprovincia de jujuy\\b',
+        r'\\bprovincia de catamarca\\b',
+        r'\\bprovincia de la rioja\\b',
+        r'\\bprovincia de san juan\\b',
+        r'\\bprovincia de santiago del estero\\b',
+        r'\\bprovincia de tierra del fuego\\b',
+        r'\\bbelen de escobar\\b',
+        r'\\bvilla allende\\b',
+        r'\\bvilla carlos paz\\b',
+        r'\\bcarlos paz\\b',
+        r'\\balta gracia\\b',
+        r'\\bvilla maria\\b',
+        r'\\brio cuarto\\b',
+        r'\\bsan francisco cordoba\\b',
+        r'\\bvilla del rosario\\b',
+        r'\\bsaldan\\b',
+        r'\\bla calera\\b'
     )
     if any(re.search(patron, direccion) for patron in patrones_fuera):
         return 'FUERA_DE_ALCANCE'
 
-    # "Córdoba, Argentina" por sí solo no prueba que sea Córdoba Capital.
-    if re.search(r'\bcordoba capital\b', direccion):
-        return 'CORDOBA_CAPITAL'
-    return 'UBICACION_INCIERTA'
+    codigos = extraer_codigos_postales(lead)
+    if len(codigos) > 1:
+        print(f"Ubicación pendiente: hay códigos postales contradictorios {codigos}", flush=True)
+        return 'UBICACION_INCIERTA'
 
+    codigo_postal = codigos[0] if codigos else ''
+    if codigo_postal:
+        # La primera letra del CPA identifica la provincia. X corresponde a Córdoba;
+        # el segundo carácter debe ser 5. X5 incluye muchas localidades, no solo Capital.
+        if not codigo_postal.startswith('X5'):
+            return 'FUERA_DE_ALCANCE'
+
+    alcance, detalle = consultar_georef_direccion(lead, codigo_postal)
+    print(
+        f"Validación geográfica: CP={codigo_postal or 'no informado'} | "
+        f"Resultado={alcance} | {detalle}",
+        flush=True
+    )
+    return alcance
 
 def evidencia_confirma_sucursal(lead, evidencia, resultado):
     """Solo acepta datos si nombre + calle/número + teléfono aparecen en la misma fuente."""
@@ -333,6 +418,7 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     DATOS EN ODOO:
     - Nombre en Odoo: {nombre_original} (Nombre corto en redes: {nombre_corto})
     - Dirección exacta cargada en Odoo: {direccion}
+    - Código postal cargado en Odoo: {lead.get('zip') or 'No informado'}
     - Ciudad cargada en Odoo: {ciudad}
     - Email actual en Odoo: {email_actual}
     - Teléfono actual en Odoo: {telefono_actual}
@@ -455,8 +541,8 @@ def ejecutar_agente():
                 continue
             if alcance == 'UBICACION_INCIERTA':
                 nota = (
-                    "Agente de Verificación: PENDIENTE. Odoo no identifica inequívocamente "
-                    "Córdoba Capital en los campos de localidad/provincia. No se realizó búsqueda "
+                    "Agente de Verificación: PENDIENTE. No se pudo confirmar Córdoba Capital "
+                    "con la dirección/código postal mediante Georef. No se realizó búsqueda "
                     "ni se modificaron datos para evitar aprobar otra localidad."
                 )
                 models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota})
