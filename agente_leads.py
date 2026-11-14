@@ -186,7 +186,9 @@ def clasificar_alcance_geografico(lead):
         'cordoba capital argentina', 'cordoba capital cordoba argentina'
     }
     if ciudad in ciudades_capital:
-        return 'CORDOBA_CAPITAL'
+        # La ciudad declarada en Odoo no reemplaza la verificación de calle y altura.
+        # Se continúa con Georef para confirmar que la dirección pertenece a Capital.
+        pass
     if ciudad:
         return 'FUERA_DE_ALCANCE'
 
