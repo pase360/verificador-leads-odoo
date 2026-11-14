@@ -1,431 +1,378 @@
 import os
 import re
 import time
-import unicodedata
 import xmlrpc.client
-from urllib.parse import urlparse, urljoin, quote_plus
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import requests
+from datetime import datetime, timedelta, timezone
+from ddgs import DDGS
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
 
-ODOO_URL = os.environ['ODOO_URL'].rstrip('/')
-ODOO_DB = os.environ['ODOO_DB']
-ODOO_USER = os.environ['ODOO_USER']
-ODOO_API_KEY = os.environ['ODOO_API_KEY']
+# Configuración desde los Secretos de GitHub
+ODOO_URL = os.environ["ODOO_URL"]
+ODOO_DB = os.environ["ODOO_DB"]
+ODOO_USER = os.environ["ODOO_USER"]
+ODOO_API_KEY = os.environ["ODOO_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-ID_ETAPA_PROSPECTOS = 5
-ID_ETAPA_CHEQUEADO = 7
-MAX_LEADS_POR_EJECUCION = 400
-MAX_RESULTADOS_GOOGLE = 7
-MAX_PAGINAS_POR_DOMINIO = 7
-TIMEOUT_NAVEGACION_MS = 18000
-PAUSA_ENTRE_LEADS = 1.5
+ID_ETAPA_CHEQUEADO = 7  # Etapa destino
+MAX_LEADS_POR_EJECUCION = 50
+INTERVALO_GEMINI_SEGUNDOS = 4.2
+MODELO_GEMINI = "gemini-3.5-flash-lite"
 
+client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
-class ErrorBusquedaGoogle(Exception):
+class ResultadoValidacion(BaseModel):
+    email_elegido: str
+    telefono_elegido: str
+    email_verificado: bool
+    telefono_verificado: bool
+    coincide_ubicacion_y_rubro: bool
+    datos_validos_y_verificados: bool
+    motivo: str
+
+class BusquedaSinEvidencia(Exception):
     pass
 
+class CuotaGeminiAgotada(Exception):
+    pass
 
-def normalizar(texto):
-    texto = unicodedata.normalize('NFKD', str(texto or ''))
-    texto = ''.join(c for c in texto if not unicodedata.combining(c))
-    return re.sub(r'\s+', ' ', texto.lower()).strip()
+class ServicioGeminiTemporal(Exception):
+    pass
 
+def generar_con_gemini(**kwargs):
+    ultimo_error = None
+    for intento in range(3):
+        time.sleep(INTERVALO_GEMINI_SEGUNDOS)
+        try:
+            return client_ai.models.generate_content(**kwargs)
+        except Exception as exc:
+            mensaje = str(exc).lower()
+            if "429" in mensaje or "resource_exhausted" in mensaje or "quota" in mensaje or "rate limit" in mensaje:
+                raise CuotaGeminiAgotada(str(exc)) from exc
+            if any(x in mensaje for x in ("503", "unavailable", "service unavailable", "deadline exceeded", "timed out", "timeout")):
+                ultimo_error = exc
+                if intento < 2:
+                    espera = 15 * (2 ** intento)
+                    print(f"Gemini temporalmente no disponible. Reintento {intento + 1}/2 en {espera} segundos.", flush=True)
+                    time.sleep(espera)
+                    continue
+                raise ServicioGeminiTemporal(str(exc)) from exc
+            raise
+    raise ServicioGeminiTemporal(str(ultimo_error or "Gemini no disponible"))
 
 def conectar_odoo():
-    common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common', allow_none=True)
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
-    if not uid:
-        raise RuntimeError('No se pudo autenticar con Odoo.')
-    models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object', allow_none=True)
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
 
-
-def limpiar_telefono(valor):
-    digitos = re.sub(r'\D', '', str(valor or ''))
-    if digitos.startswith('549') and len(digitos) == 13:
-        return digitos
-    if digitos.startswith('54') and len(digitos) == 12:
-        return '549' + digitos[2:]
-    if digitos.startswith('0'):
-        digitos = digitos[1:]
-    if len(digitos) in (11, 12) and digitos[2:4] == '15':
-        digitos = digitos[:2] + digitos[4:]
-    elif len(digitos) in (11, 12) and digitos[3:5] == '15':
-        digitos = digitos[:3] + digitos[5:]
-    if len(digitos) == 10:
-        return '549' + digitos
-    return digitos
+def es_cordoba_capital(lead):
+    # La ciudad de Odoo puede estar vacía aunque la dirección esté completa.
+    # La pertenencia a Córdoba Capital se valida con evidencia durante la auditoría,
+    # no se descarta automáticamente por un campo city vacío.
+    ciudad = (lead.get('city') or '').strip().lower()
+    ciudad = (ciudad.replace('á', 'a').replace('é', 'e')
+                   .replace('í', 'i').replace('ó', 'o').replace('ú', 'u'))
+    return ciudad in ('cordoba', 'cordoba capital', 'capital')
 
 
-def extraer_telefonos(texto):
-    patrones = re.findall(
-        r'(?:\+?54\s*9?\s*)?(?:\(?0?\d{2,4}\)?[\s.-]*)?(?:15[\s.-]*)?\d{6,8}',
-        texto or ''
-    )
-    encontrados = []
-    for patron in patrones:
-        numero = limpiar_telefono(patron)
-        if 10 <= len(numero) <= 13 and numero not in encontrados:
-            encontrados.append(numero)
-    return encontrados
-
-
-def extraer_emails(texto):
-    encontrados = re.findall(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', texto or '', re.I)
-    salida = []
-    for email in encontrados:
-        email = email.lower().strip('.,;:()[]{}<>')
-        if not any(x in email for x in ('example.com', 'wixpress.com', 'sentry.io', 'cloudflare.com')):
-            if email not in salida:
-                salida.append(email)
-    return salida
-
-
-def texto_pagina(page):
-    try:
-        texto = page.locator('body').inner_text(timeout=5000)
-        try:
-            hrefs = page.locator('a[href]').evaluate_all(
-                "els => els.map(a => a.href).slice(0, 180)"
-            )
-            texto += '\nENLACES PUBLICADOS:\n' + '\n'.join(hrefs)
-        except Exception:
-            pass
-        return texto[:24000]
-    except Exception:
-        return ''
-
-
-def buscar_en_google(page, nombre, direccion, consulta_extra=''):
-    consulta = f'"{nombre}" "{direccion}" Córdoba Argentina {consulta_extra}'.strip()
-    url = 'https://www.google.com/search?q=' + quote_plus(consulta) + '&hl=es&gl=ar'
-    try:
-        page.goto(url, wait_until='domcontentloaded', timeout=TIMEOUT_NAVEGACION_MS)
-        page.wait_for_timeout(1800)
-    except PlaywrightTimeoutError:
-        pass
-    actual = page.url.lower()
-    contenido = texto_pagina(page)
-    contenido_norm = normalizar(contenido)
-    if 'sorry' in actual or 'unusual traffic' in contenido_norm or 'captcha' in contenido_norm:
-        raise ErrorBusquedaGoogle('Google solicito una verificacion antirobot.')
-    links = []
-    try:
-        anchors = page.locator('a:has(h3)')
-        for i in range(min(anchors.count(), MAX_RESULTADOS_GOOGLE)):
-            anchor = anchors.nth(i)
-            href = anchor.get_attribute('href') or ''
-            titulo = anchor.inner_text(timeout=1500) or ''
-            if href.startswith('http') and 'google.com' not in urlparse(href).netloc:
-                if href not in [item[0] for item in links]:
-                    links.append((href, titulo))
-    except Exception:
-        pass
-    if not links and not contenido:
-        raise ErrorBusquedaGoogle('Google no devolvio resultados legibles.')
-    return consulta, contenido, links
-
-
-def recolectar_sitio(contexto, url):
-    paginas = []
-    redes = []
-    try:
-        page = contexto.new_page()
-        page.set_default_navigation_timeout(TIMEOUT_NAVEGACION_MS)
-        page.goto(url, wait_until='domcontentloaded', timeout=TIMEOUT_NAVEGACION_MS)
-        page.wait_for_timeout(700)
-        paginas.append((page.url, texto_pagina(page)))
-        dominio = urlparse(page.url).netloc.lower().replace('www.', '')
-        enlaces = page.locator('a[href]')
-        internas = []
-        for i in range(min(enlaces.count(), 250)):
-            href = enlaces.nth(i).get_attribute('href') or ''
-            if not href:
-                continue
-            absoluto = urljoin(page.url, href)
-            host = urlparse(absoluto).netloc.lower().replace('www.', '')
-            if any(red in host for red in ('facebook.com', 'instagram.com', 'linkedin.com', 'tiktok.com')):
-                if absoluto not in redes:
-                    redes.append(absoluto)
-            elif host == dominio and any(
-                palabra in normalizar(absoluto)
-                for palabra in ('contact', 'contacto', 'ventas', 'sucursal', 'nosotros', 'about', 'empresa', 'whatsapp')
-            ):
-                if absoluto not in internas and absoluto != page.url:
-                    internas.append(absoluto)
-        for suburl in internas[:MAX_PAGINAS_POR_DOMINIO - 1]:
-            try:
-                page.goto(suburl, wait_until='domcontentloaded', timeout=TIMEOUT_NAVEGACION_MS)
-                page.wait_for_timeout(350)
-                paginas.append((page.url, texto_pagina(page)))
-            except Exception:
-                continue
-        page.close()
-    except Exception:
-        pass
-    return paginas, redes
-
-
-def investigar_lead(contexto, lead):
-    nombre = (lead.get('partner_name') or lead.get('name') or '').strip()
-    direccion = (lead.get('street') or '').strip()
-    if not nombre or not direccion:
-        return {
-            'aprobado': False,
-            'motivo': 'Falta nombre o direccion en Odoo.',
-            'email': '',
-            'telefono': '',
-            'email_verificado': False,
-            'telefono_verificado': False,
-        }
-
-    google = contexto.new_page()
-    google.set_default_navigation_timeout(TIMEOUT_NAVEGACION_MS)
-    consulta, google_texto, resultados = buscar_en_google(google, nombre, direccion)
-    urls = [url for url, _ in resultados]
-    evidencias_google = [f'GOOGLE {consulta}\n{google_texto[:12000]}']
-
-    consulta_social = f'"{nombre}" "{direccion}" (site:facebook.com OR site:instagram.com) contacto email telefono'
-    try:
-        _, texto_social, resultados_sociales = buscar_en_google(
-            google, nombre, direccion,
-            '(site:facebook.com OR site:instagram.com) contacto email telefono'
-        )
-        evidencias_google.append(f'GOOGLE REDES {consulta_social}\n{texto_social[:8000]}')
-        urls.extend(url for url, _ in resultados_sociales if url not in urls)
-    except ErrorBusquedaGoogle:
-        pass
-    google.close()
-
-    paginas = []
-    redes = []
-    dominios_visitados = set()
-    for url in urls:
-        host = urlparse(url).netloc.lower().replace('www.', '')
-        if not host or host in dominios_visitados:
-            continue
-        dominios_visitados.add(host)
-        paginas_sitio, redes_sitio = recolectar_sitio(contexto, url)
-        paginas.extend(paginas_sitio)
-        redes.extend(redes_sitio)
-        if len(paginas) >= 18:
-            break
-
-    # Solo se visitan perfiles sociales que aparecen enlazados desde los resultados/sitios.
-    for red in list(dict.fromkeys(redes))[:4]:
-        try:
-            page = contexto.new_page()
-            page.goto(red, wait_until='domcontentloaded', timeout=10000)
-            paginas.append((page.url, texto_pagina(page)))
-            page.close()
-        except Exception:
-            continue
-
-    nombre_norm = normalizar(nombre)
-    direccion_norm = normalizar(direccion)
-    palabras_nombre = [x for x in re.findall(r'[a-z0-9]+', nombre_norm) if len(x) > 2]
-    numeros_direccion = re.findall(r'\d+', direccion_norm)
-    palabras_calle = [
-        x for x in re.findall(r'[a-z]+', direccion_norm)
-        if len(x) > 3 and x not in ('avenida', 'calle', 'cordoba', 'argentina')
+def limpiar_nombre_busqueda(nombre):
+    palabras_rubro = [
+        r'\bdiet[eé]tica\b', r'\bverduler[ií]a\b', r'\bferreter[ií]a\b',
+        r'\bflorer[ií]a\b', r'\bfarmacia\b', r'\bcotill[oó]n\b',
+        r'\bpanader[ií]a\b', r'\bcarnicer[ií]a\b', r'\bhelader[ií]a\b',
+        r'\bpinturer[ií]a\b', r'\bpeluquer[ií]a\b', r'\bkiosco\b',
+        r'\bautolavadero\b', r'\btienda\b', r'\balmac[eé]n\b'
     ]
+    limpio = nombre
+    for patron in palabras_rubro:
+        limpio = re.sub(patron, '', limpio, flags=re.IGNORECASE)
+    limpio = re.sub(r'\s+', ' ', limpio).strip()
+    return limpio if len(limpio) >= 3 else nombre
 
-    # Nombre, calle, numero y Cordoba deben aparecer juntos en una misma fuente.
-    fuentes = [('Google', google_texto)] + paginas
-    fuente_identidad_direccion = False
-    for _, texto in fuentes:
-        t = normalizar(texto)
-        nombre_ok = bool(palabras_nombre) and sum(x in t for x in palabras_nombre) >= max(1, min(2, len(palabras_nombre)))
-        numero_ok = bool(numeros_direccion) and any(n in t for n in numeros_direccion)
-        calle_ok = not palabras_calle or any(x in t for x in palabras_calle[:2])
-        cordoba_ok = 'cordoba' in t
-        if nombre_ok and numero_ok and calle_ok and cordoba_ok:
-            fuente_identidad_direccion = True
-            break
+def limpiar_formato_celular(numero):
+    if not numero:
+        return ""
+    solo_digitos = re.sub(r'\D', '', str(numero))
+    if not solo_digitos:
+        return ""
+    if solo_digitos.startswith("549") and len(solo_digitos) == 13:
+        return f"+{solo_digitos}"
+    if solo_digitos.startswith("54") and len(solo_digitos) == 12:
+        return f"+549{solo_digitos[2:]}"
+    if solo_digitos.startswith("0") and len(solo_digitos) == 11:
+        return f"+549{solo_digitos[1:]}"
+    if len(solo_digitos) == 10:
+        return f"+549{solo_digitos}"
+    if solo_digitos.startswith("0") and len(solo_digitos) == 13 and solo_digitos[4:6] == "15":
+        return f"+549{solo_digitos[1:4]}{solo_digitos[6:]}"
+    if len(solo_digitos) == 12 and solo_digitos[3:5] == "15":
+        return f"+549{solo_digitos[:3]}{solo_digitos[5:]}"
+    return f"+{solo_digitos}" if str(numero).strip().startswith("+") else solo_digitos
 
-    # Solo se toman telefonos y correos de dominios cuyo contenido identifica al comercio.
-    dominios_del_comercio = set()
-    for url, texto in paginas:
-        t = normalizar(texto)
-        coincidencias_nombre = sum(x in t for x in palabras_nombre)
-        if palabras_nombre and coincidencias_nombre >= max(1, min(2, len(palabras_nombre))):
-            host = urlparse(url).netloc.lower().replace('www.', '')
-            if host:
-                dominios_del_comercio.add(host)
+def extraer_texto_de_url(url):
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Language': 'es-AR,es;q=0.9'
+        }
+        response = requests.get(url, headers=headers, timeout=12)
+        if response.status_code == 200:
+            texto = response.text
+            whatsapp_links = re.findall(r'(?:wa\.me/|whatsapp\.com/send\?phone=|whatsapp://send\?phone=)([0-9+\s-]+)', texto, re.IGNORECASE)
+            whatsapp_limpios = [re.sub(r'\D', '', w) for w in whatsapp_links if len(re.sub(r'\D', '', w)) >= 8]
+            emails_html = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', texto)
+            emails_filtrados = list(set([e.lower() for e in emails_html if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', 'sentry.io', 'wixpress.com', 'example.com'))]))
+            
+            info_extra = ""
+            if whatsapp_limpios:
+                info_extra += f"\n[BOTÓN DE WHATSAPP EN WEB: {', '.join(set(whatsapp_limpios))}]"
+            if emails_filtrados:
+                info_extra += f"\n[CORREOS DETECTADOS EN EL CÓDIGO DE LA WEB: {', '.join(emails_filtrados[:5])}]"
+            
+            texto_limpio = re.sub(r'<script[^>]*>.*?</script>', ' ', texto, flags=re.DOTALL | re.IGNORECASE)
+            texto_limpio = re.sub(r'<style[^>]*>.*?</style>', ' ', texto_limpio, flags=re.DOTALL | re.IGNORECASE)
+            texto_limpio = re.sub(r'<[^>]+>', ' ', texto_limpio)
+            texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
+            return f"{info_extra}\nContenido visible: {texto_limpio[:4000]}"
+    except Exception:
+        return ""
+    return ""
 
-    telefonos_paginas = []
-    telefonos_whatsapp = []
-    emails = []
-    for url, texto in paginas:
-        host = urlparse(url).netloc.lower().replace('www.', '')
-        if host not in dominios_del_comercio:
+def ejecutar_consulta_ddgs(query, max_res=7):
+    try:
+        resultados = DDGS().text(query, region="ar-es", max_results=max_res)
+        return resultados if resultados else []
+    except Exception:
+        return []
+
+def investigacion_profunda_con_google_search(lead):
+    nombre_original = lead.get('partner_name') or lead.get('name') or ''
+    nombre_corto = limpiar_nombre_busqueda(nombre_original)
+    direccion = lead.get('street') or ''
+    ciudad = lead.get('city') or 'Córdoba Capital (verificar con la dirección; no asumir)'
+    calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
+    
+    reporte_total = []
+    urls_encontradas = []
+
+    q1 = f'{nombre_original} {calle_busqueda} {ciudad} contacto whatsapp email'
+    print(f"-> Buscando en web: {q1}", flush=True)
+    res1 = ejecutar_consulta_ddgs(q1, max_res=6)
+    snippets1 = []
+    for item in res1:
+        link = item.get('href', '')
+        snippets1.append(f"- {item.get('title')} | {item.get('body')} | {link}")
+        if link.startswith("http") and "instagram.com" not in link and "facebook.com" not in link and len(urls_encontradas) < 3:
+            urls_encontradas.append(link)
+    if snippets1:
+        reporte_total.append("=== BÚSQUEDA WEB GENERAL ===\n" + "\n".join(snippets1))
+    time.sleep(1)
+
+    q2 = f'"{nombre_corto}" {calle_busqueda} {ciudad} (site:facebook.com OR site:instagram.com)' if calle_busqueda else f'"{nombre_corto}" {ciudad} (site:facebook.com OR site:instagram.com)'
+    print(f"-> Buscando en Facebook/Instagram: {q2}", flush=True)
+    res2 = ejecutar_consulta_ddgs(q2, max_res=6)
+    if res2:
+        snippets2 = [f"- {i.get('title')} | {i.get('body')} | {i.get('href')}" for i in res2]
+        reporte_total.append("=== RESULTADOS DE FACEBOOK E INSTAGRAM ===\n" + "\n".join(snippets2))
+    time.sleep(1)
+
+    q3 = f'"{nombre_corto}" {calle_busqueda} ("@gmail.com" OR "@hotmail.com" OR "@yahoo.com")'
+    print(f"-> Rastreando correos electrónicos: {q3}", flush=True)
+    res3 = ejecutar_consulta_ddgs(q3, max_res=5)
+    if res3:
+        snippets3 = [f"- {i.get('title')} | {i.get('body')} | {i.get('href')}" for i in res3]
+        reporte_total.append("=== RASTREO DE EMAILS ===\n" + "\n".join(snippets3))
+    time.sleep(1)
+
+    for url in list(set(urls_encontradas)):
+        if "wa.me" in url or "api.whatsapp.com" in url:
+            num_wa = re.sub(r'\D', '', url)
+            reporte_total.append(f"=== ENLACE DIRECTO WHATSAPP ===\nNúmero: {num_wa}")
             continue
-        telefonos_paginas.extend(extraer_telefonos(texto))
-        emails.extend(extraer_emails(texto))
-        for coincidencia in re.findall(
-            r'(?:wa\.me/|api\.whatsapp\.com/send\?phone=|whatsapp\.com/send\?phone=)([+\d%20-]+)',
-            texto, re.I
-        ):
-            numero = limpiar_telefono(coincidencia)
-            if 10 <= len(numero) <= 13:
-                telefonos_whatsapp.append(numero)
+        print(f"-> Entrando a web oficial: {url}", flush=True)
+        contenido = extraer_texto_de_url(url)
+        if contenido:
+            reporte_total.append(f"=== CONTENIDO WEB ({url}) ===\n{contenido}")
+        time.sleep(1)
 
-    telefonos_whatsapp = list(dict.fromkeys(telefonos_whatsapp))
-    telefonos_paginas = list(dict.fromkeys(telefonos_paginas))
-    emails = list(dict.fromkeys(emails))
-    telefono_odoo = limpiar_telefono(lead.get('phone'))
+    evidencia = "\n\n".join(reporte_total).strip()
+    if not evidencia:
+        raise BusquedaSinEvidencia("DuckDuckGo no entregó resultados ni páginas verificables.")
+    return evidencia
 
-    if telefonos_whatsapp:
-        telefono_elegido = telefonos_whatsapp[0]
-        telefono_verificado = True
-    elif telefono_odoo and telefono_odoo in telefonos_paginas:
-        telefono_elegido = telefono_odoo
-        telefono_verificado = True
-    else:
-        telefono_elegido = ''
-        telefono_verificado = False
+def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
+    nombre_original = lead.get('partner_name') or lead.get('name') or ''
+    nombre_corto = limpiar_nombre_busqueda(nombre_original)
+    direccion = lead.get('street') or 'No especificada'
+    ciudad = lead.get('city') or 'Córdoba'
+    email_actual = lead.get('email_from') or 'VACÍO'
+    telefono_actual = lead.get('phone') or 'VACÍO'
 
-    email_elegido = emails[0] if emails else ''
-    ciudad_odo = normalizar(lead.get('city'))
-    localidades_excluidas = (
-        'villa allende', 'saldan', 'la calera', 'villa carlos paz',
-        'carlos paz', 'alta gracia', 'villa maria', 'san francisco',
-        'rio cuarto', 'rio tercero', 'jesus maria', 'cosquin'
+    prompt = f"""
+    Eres un investigador experto en empresas y comercios de Argentina. Usa los resultados de DuckDuckGo y las páginas web obtenidas previamente para encontrar el EMAIL y el TELÉFONO/WHATSAPP reales de este comercio.
+
+    DATOS EN ODOO:
+    - Nombre en Odoo: {nombre_original} (Nombre corto en redes: {nombre_corto})
+    - Dirección exacta cargada en Odoo: {direccion}
+    - Ciudad cargada en Odoo: {ciudad}
+    - Email actual en Odoo: {email_actual}
+    - Teléfono actual en Odoo: {telefono_actual}
+
+    RESULTADOS PREVIOS DE RASTREO:
+    {info_duckduckgo}
+
+    INSTRUCCIONES OBLIGATORIAS DE BÚSQUEDA Y VALIDACIÓN:
+    1. USA ÚNICAMENTE LA EVIDENCIA INCLUIDA:
+       - Usa solo los resultados de DuckDuckGo y el contenido de páginas efectivamente descargadas.
+       - No afirmes haber consultado fuentes que no aparecen en la evidencia.
+       - No completes datos por intuición ni por similitud de nombres.
+    2. IDENTIDAD, UBICACIÓN Y RUBRO:
+       - Confirma que el nombre corresponde al comercio buscado y que la dirección/sucursal coincide con la dirección exacta de Odoo.
+       - ALCANCE GEOGRÁFICO OBLIGATORIO: solo aprobar direcciones ubicadas dentro de Córdoba Capital, Córdoba, Argentina. La ciudad de Odoo puede estar vacía; en ese caso determina la localidad usando la dirección completa, código postal y evidencia de las fuentes. No confundas Córdoba Capital con localidades cercanas (por ejemplo Saldán, Villa Allende, La Calera, Carlos Paz, Villa María) ni con otras provincias. Si no puedes confirmar que está dentro del ejido de Córdoba Capital, coincide_ubicacion_y_rubro=FALSE.
+       - Confirma que el rubro es compatible con el comercio. No uses datos de otra sucursal, otra ciudad, otro negocio homónimo ni de la marca en general si no se puede vincular al local.
+       - Si no puedes confirmar comercio, dirección y rubro con evidencia concreta, coincide_ubicacion_y_rubro=FALSE y no apruebes.
+    3. TELÉFONO OBLIGATORIO:
+       - telefono_verificado=TRUE solo si el número aparece literalmente en una fuente pública confiable y se puede vincular a este comercio/sucursal.
+       - Si el teléfono oficial encontrado difiere del de Odoo, devuelve el oficial normalizado con +549 cuando corresponda.
+       - Prioriza WhatsApp o móvil si hay varios. Nunca valides un teléfono solo porque figura en Odoo.
+    4. EMAIL OPCIONAL:
+       - El email NO es requisito para aprobar.
+       - Si encuentras un correo publicado literalmente y vinculado a este comercio/sucursal, devuelve email_elegido y email_verificado=TRUE.
+       - Si no encuentras email confiable, devuelve email_elegido="" y email_verificado=FALSE. Esto NO debe impedir la aprobación.
+       - Nunca inventes ni atribuyas emails de negocios homónimos, otras sucursales o empresas de otra ciudad.
+    5. RESULTADO:
+       - datos_validos_y_verificados=TRUE si y solo si la identidad del comercio, la dirección exacta/sucursal, el rubro y el teléfono están confirmados.
+       - No exijas email para datos_validos_y_verificados.
+       - Nunca marques como verificado un dato solo porque ya estaba cargado en Odoo.
+    """
+
+    # Una sola llamada por lead: toda la evidencia ya fue reunida por DuckDuckGo y la lectura de webs.
+    response = generar_con_gemini(
+        model=MODELO_GEMINI,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ResultadoValidacion,
+            temperature=0.0,
+        ),
     )
-    ciudad_odo_ok = (
-        (not ciudad_odo or 'cordoba' in ciudad_odo or 'capital' in ciudad_odo)
-        and not any(localidad in ciudad_odo for localidad in localidades_excluidas)
-    )
-    aprobado = fuente_identidad_direccion and ciudad_odo_ok and telefono_verificado
-    faltantes = []
-    if not fuente_identidad_direccion:
-        faltantes.append('no se confirmaron juntos nombre, direccion y Cordoba en una misma fuente')
-    if not ciudad_odo_ok:
-        faltantes.append('la ciudad cargada en Odoo esta fuera de Cordoba Capital')
-    if not telefono_verificado:
-        faltantes.append('no se verifico el telefono de Odoo ni un WhatsApp publicado')
-    motivo = (
-        'Nombre, direccion y telefono verificados en fuentes publicas.'
-        if aprobado else '; '.join(faltantes)
-    )
-    return {
-        'aprobado': aprobado,
-        'motivo': motivo,
-        'email': email_elegido,
-        'telefono': telefono_elegido,
-        'email_verificado': bool(email_elegido),
-        'telefono_verificado': telefono_verificado,
-        'nombre_encontrado': fuente_identidad_direccion,
-        'direccion_encontrada': fuente_identidad_direccion,
-        'telefonos_whatsapp': telefonos_whatsapp,
-        'telefonos_paginas': telefonos_paginas,
-        'urls': urls,
-    }
-
+    return response.parsed
 
 def ejecutar_agente():
-    print('Conectando a Odoo...', flush=True)
+    print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
-    campos = [
-        'id', 'name', 'partner_name', 'contact_name', 'email_from',
-        'phone', 'website', 'street', 'city', 'country_id'
-    ]
+
+    # SOLO se leen leads ya existentes en la etapa Prospectos por Controlar.
+    # No se crean contactos, leads ni oportunidades nuevas.
+    id_prospectos = 5
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'country_id']
     leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [[['stage_id', '=', ID_ETAPA_PROSPECTOS]]],
+        [[['stage_id', '=', id_prospectos]]],
         {'fields': campos, 'limit': MAX_LEADS_POR_EJECUCION, 'order': 'id asc'}
     )
-    total = len(leads)
     print(
-        f'Leads encontrados en Prospectos por Controlar: {total}. '
-        f'Limite por ejecucion: {MAX_LEADS_POR_EJECUCION}.',
+        f"Auditoria de leads EXISTENTES en Prospectos por Controlar (etapa {id_prospectos}). "
+        f"Encontrados: {len(leads)} | Maximo por ejecucion: {MAX_LEADS_POR_EJECUCION}. "
+        f"Modelo: {MODELO_GEMINI}.",
         flush=True
     )
     if not leads:
+        print("No hay leads pendientes para auditar.", flush=True)
         return
 
-    procesados = aprobados = pendientes = errores_google = 0
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=True, args=['--no-sandbox', '--disable-dev-shm-usage']
+    aprobados = 0
+    pendientes = 0
+    procesados = 0
+    fallas_busqueda = 0
+    no_auditados = 0
+
+    for lead in leads:
+        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
+
+        try:
+            info_ddgs = investigacion_profunda_con_google_search(lead)
+            resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
+        except BusquedaSinEvidencia as e:
+            fallas_busqueda += 1
+            print(f"BUSQUEDA SIN EVIDENCIA. No se modifica el lead y queda pendiente: {e}", flush=True)
+            continue
+        except CuotaGeminiAgotada as e:
+            print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
+            break
+        except ServicioGeminiTemporal as e:
+            no_auditados += 1
+            print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}", flush=True)
+            break
+        except Exception as e:
+            print(f"Error de Gemini en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
+            pendientes += 1
+            continue
+
+        email_final = (resultado.email_elegido or '').strip().lower()
+        telefono_formateado = limpiar_formato_celular(resultado.telefono_elegido)
+        email_actual = (lead.get('email_from') or '').strip().lower()
+        telefono_actual = limpiar_formato_celular(lead.get('phone'))
+
+        email_definitivo = email_final if email_final else email_actual
+        telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
+
+        telefono_verificado = bool(resultado.telefono_verificado and telefono_formateado)
+        aprobado_final = bool(
+            resultado.coincide_ubicacion_y_rubro and
+            resultado.datos_validos_y_verificados and
+            telefono_verificado
         )
-        contexto = browser.new_context(
-            locale='es-AR',
-            timezone_id='America/Argentina/Cordoba',
-            viewport={'width': 1365, 'height': 900}
+
+        if aprobado_final:
+            motivo_ajustado = resultado.motivo
+        else:
+            faltantes = []
+            if not telefono_verificado:
+                faltantes.append("teléfono no confirmado")
+            if not resultado.coincide_ubicacion_y_rubro:
+                faltantes.append("ubicación/rubro no confirmado")
+            motivo_ajustado = f"{resultado.motivo} [NO APROBADO: {', '.join(faltantes) or 'validación insuficiente'}]."
+
+        print(
+            f"Resultado: Aprobado={aprobado_final} | Email verificado={resultado.email_verificado} "
+            f"| Teléfono verificado={resultado.telefono_verificado} "
+            f"| Tel={telefono_definitivo} | Email={email_definitivo}",
+            flush=True
         )
-        consecutivos_google = 0
-        for lead in leads:
-            print(
-                f"\n--- Lead {lead['id']}: {lead.get('partner_name') or lead.get('name')} "
-                f"| {lead.get('street') or 'SIN DIRECCION'} ---",
-                flush=True
-            )
-            try:
-                resultado = investigar_lead(contexto, lead)
-                consecutivos_google = 0
-            except ErrorBusquedaGoogle as exc:
-                errores_google += 1
-                consecutivos_google += 1
-                pendientes += 1
-                print(f'BUSQUEDA NO DISPONIBLE: {exc}. Se conserva pendiente.', flush=True)
-                if consecutivos_google >= 3:
-                    print(
-                        'Google bloqueo o no entrego resultados en 3 leads consecutivos. '
-                        'Se detiene para evitar procesar mal.',
-                        flush=True
-                    )
-                    break
-                continue
-            except Exception as exc:
-                pendientes += 1
-                print(f"ERROR EN LEAD {lead['id']}: {exc}. Se conserva pendiente.", flush=True)
-                continue
+        print(f"Detalle: {motivo_ajustado}", flush=True)
 
-            print(
-                f"Verificacion: nombre/direccion={resultado.get('nombre_encontrado')} "
-                f"telefono={resultado.get('telefono_verificado')} "
-                f"WhatsApp={resultado.get('telefonos_whatsapp')} "
-                f"email={resultado.get('email') or 'no encontrado'}",
-                flush=True
-            )
-            print(f"Detalle: {resultado['motivo']}", flush=True)
+        valores_actualizar = {}
+        if resultado.coincide_ubicacion_y_rubro and email_final and email_final != email_actual and resultado.email_verificado:
+            valores_actualizar['email_from'] = email_final
+        if resultado.coincide_ubicacion_y_rubro and telefono_formateado and telefono_formateado != telefono_actual and resultado.telefono_verificado:
+            valores_actualizar['phone'] = telefono_formateado
+        if aprobado_final:
+            valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
 
-            valores = {}
-            email_actual = (lead.get('email_from') or '').strip().lower()
-            telefono_actual = limpiar_telefono(lead.get('phone'))
-            if resultado.get('email_verificado') and resultado['email'] and resultado['email'] != email_actual:
-                valores['email_from'] = resultado['email']
-            if resultado.get('telefono_verificado') and resultado['telefono'] and resultado['telefono'] != telefono_actual:
-                valores['phone'] = '+' + resultado['telefono']
-            if resultado['aprobado']:
-                valores['stage_id'] = ID_ETAPA_CHEQUEADO
+        if valores_actualizar:
+            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
 
-            if valores:
-                models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write',
-                    [[lead['id']], valores]
-                )
-            nota = 'Agente revisor (navegacion web): ' + resultado['motivo']
-            models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post',
-                [[lead['id']]], {'body': nota}
-            )
-            procesados += 1
-            if resultado['aprobado']:
-                aprobados += 1
-            else:
-                pendientes += 1
-            time.sleep(PAUSA_ENTRE_LEADS)
-        browser.close()
+        mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': mensaje_nota})
 
-    no_alcanzados = total - procesados - pendientes
+        procesados += 1
+        if aprobado_final:
+            aprobados += 1
+        else:
+            pendientes += 1
+
     print(
-        f'\nRESUMEN: encontrados={total} | procesados={procesados} | '
-        f'aprobados={aprobados} | pendientes={pendientes} | '
-        f'fallas_google={errores_google} | no_alcanzados={no_alcanzados}',
+        f"\nRESUMEN: encontrados={len(leads)} | auditados={procesados} | aprobados={aprobados} "
+        f"| pendientes_auditados={pendientes} | fallas_busqueda={fallas_busqueda} "
+        f"| no_auditados={len(leads)-procesados-fallas_busqueda}",
         flush=True
     )
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     ejecutar_agente()
