@@ -86,13 +86,28 @@ def clasificar_alcance_geografico(lead):
 
     if pais_nombre and pais_nombre not in ('argentina',):
         return 'FUERA_DE_ALCANCE'
-    if provincia_nombre and provincia_nombre not in ('cordoba', 'cordoba capital'):
+
+    provincias_cordoba = ('cordoba', 'cordoba capital')
+    if provincia_nombre and provincia_nombre not in provincias_cordoba:
         return 'FUERA_DE_ALCANCE'
-    if ciudad and ciudad not in ('cordoba', 'cordoba capital', 'capital'):
-        return 'FUERA_DE_ALCANCE'
-    if ciudad in ('cordoba', 'cordoba capital', 'capital'):
+
+    # Odoo puede guardar la localidad con la provincia repetida o el país agregado.
+    # Solo aceptamos variantes inequívocas de Córdoba Capital; cualquier otra ciudad
+    # de la provincia (Villa Allende, Villa del Rosario, Carlos Paz, etc.) queda fuera.
+    ciudades_capital = {
+        'cordoba', 'cordoba capital', 'capital',
+        'cordoba cordoba', 'cordoba capital cordoba',
+        'cordoba argentina', 'cordoba cordoba argentina',
+        'cordoba capital argentina', 'cordoba capital cordoba argentina'
+    }
+    if ciudad in ciudades_capital:
         return 'CORDOBA_CAPITAL'
-    if 'cordoba capital' in direccion:
+    if ciudad:
+        return 'FUERA_DE_ALCANCE'
+
+    # Si Odoo no completó city, solo aceptamos una mención explícita de Córdoba Capital
+    # en la dirección. "Córdoba, Argentina" por sí solo no alcanza.
+    if re.search(r'\\bcordoba capital\\b', direccion):
         return 'CORDOBA_CAPITAL'
     return 'UBICACION_INCIERTA'
 
