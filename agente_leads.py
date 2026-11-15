@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import unicodedata
+from types import SimpleNamespace
 import xmlrpc.client
 import requests
 from datetime import datetime, timedelta, timezone
@@ -98,8 +100,8 @@ def conectar_odoo():
 
 
 def normalizar_texto(valor):
-    valor = (valor or '').lower()
-    valor = valor.replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u')
+    valor = unicodedata.normalize('NFKD', (valor or '').lower())
+    valor = ''.join(c for c in valor if not unicodedata.combining(c))
     valor = re.sub(r'[^a-z0-9]+', ' ', valor)
     return re.sub(r'\s+', ' ', valor).strip()
 
@@ -277,6 +279,12 @@ def clasificar_alcance_geografico(lead):
 
 
 def limpiar_nombre_busqueda(nombre):
+    # Quita la sucursal entre corchetes y lo que sigue a un guion largo: "Marca – Rubro [Barrio]" -> "Marca"
+    nombre = re.sub(r'\[.*?\]', '', nombre or '')
+    partes = re.split(r'\s[–—-]\s', nombre, maxsplit=1)
+    if len(partes) == 2 and len(partes[0].strip()) >= 4:
+        nombre = partes[0]
+    nombre = nombre.strip()
     palabras_rubro = [
         r'\bdiet[eé]tica\b', r'\bverduler[ií]a\b', r'\bferreter[ií]a\b',
         r'\bflorer[ií]a\b', r'\bfarmacia\b', r'\bcotill[oó]n\b',
@@ -354,7 +362,7 @@ def url_del_bloque(bloque):
 
 
 def nombres_del_lead(lead):
-    base = lead.get('partner_name') or lead.get('name') or ''
+    base = re.sub(r'\[.*?\]', '', lead.get('partner_name') or lead.get('name') or '')
     return normalizar_texto(base), normalizar_texto(limpiar_nombre_busqueda(base))
 
 
@@ -666,7 +674,7 @@ def investigacion_profunda_con_google_search(lead):
     consultas = [
         (f'"{nombre_corto}" Córdoba sitio web oficial contacto', 8, "BÚSQUEDA DE SITIO OFICIAL"),
         (f'{base} email correo electrónico contacto', 8, "BÚSQUEDA PRIORITARIA DE EMAIL"),
-        (f'{base} mail @gmail.com OR @hotmail.com OR @outlook.com OR @yahoo.com', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
+        (f'{base} correo gmail hotmail', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
         (f'"{nombre_corto}" "{calle_busqueda}" contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
         (f'"{nombre_corto}" Córdoba Facebook Instagram contacto email', 7, "BÚSQUEDA EN REDES SOCIALES"),
         (f'"{nombre_corto}" "{calle_busqueda}" "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
@@ -710,6 +718,12 @@ def investigacion_profunda_con_google_search(lead):
             puntos -= 20
         return puntos
 
+    # Solo se abren páginas que nombran al comercio o su dirección (evita Outlook, Yahoo, etc.).
+    def es_relevante(item):
+        link, titulo, cuerpo = item
+        texto = normalizar_texto(titulo + ' ' + cuerpo)
+        return url_coincide_con_nombre(lead, link) or nombre_en_bloque(lead, texto) or calle_confirmada(lead, texto)
+    resultados_urls = [x for x in resultados_urls if es_relevante(x)]
     resultados_urls.sort(key=puntuacion, reverse=True)
     urls_para_abrir = [x[0] for x in resultados_urls[:8]]
 
@@ -908,7 +922,14 @@ def ejecutar_agente():
             # Si Georef no confirma la dirección exacta, igual se busca, pero en ese caso
             # cada fuente debe nombrar Córdoba para poder aprobar (ver evaluar_evidencia).
             info_ddgs = investigacion_profunda_con_google_search(lead)
-            resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
+            # Gemini solo se consulta si la búsqueda halló algún mail o teléfono que confirmar:
+            # si no hay nada, no puede aportar y se ahorra cuota diaria.
+            vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
+            previa = evaluar_evidencia(lead, info_ddgs, vacio, alcance)
+            if previa['email'] or previa['telefono']:
+                resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
+            else:
+                resultado = vacio
 
         except BusquedaSinEvidencia as e:
             fallas_busqueda += 1
@@ -918,14 +939,10 @@ def ejecutar_agente():
             print(f"BUSQUEDA SIN EVIDENCIA. No se modifica el lead y queda pendiente: {e}", flush=True)
             continue
         except CuotaGeminiAgotada as e:
-            nota_error = f"Agente de Verificación: PENDIENTE. Ejecución detenida por límite de cuota de Gemini; no se modificaron los datos: {e}"
-            registrar_nota(models, uid, lead['id'], nota_error)
             print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
             break
         except ServicioGeminiTemporal as e:
             no_auditados += 1
-            nota_error = f"Agente de Verificación: PENDIENTE. Gemini no estuvo disponible; no se modificaron los datos: {e}"
-            registrar_nota(models, uid, lead['id'], nota_error)
             print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}", flush=True)
             break
         except Exception as e:
@@ -1001,7 +1018,7 @@ def ejecutar_agente():
                 faltantes.append("no se confirmó email ni teléfono en una página que pertenezca claramente al comercio")
             if not evidencia['nombre_ok']:
                 faltantes.append("el nombre no apareció junto a la calle, el teléfono cargado o una web propia")
-            if not resultado.coincide_ubicacion_y_rubro:
+            if contacto_verificado and not resultado.coincide_ubicacion_y_rubro:
                 faltantes.append("no coincide ubicación o rubro")
             partes_nota.append("No pasa a Chequeado: " + ", ".join(faltantes or ["validación insuficiente"]) + ".")
             if evidencia['candidatos']:
