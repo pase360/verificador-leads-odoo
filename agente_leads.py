@@ -4,6 +4,7 @@ import time
 import xmlrpc.client
 import requests
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urljoin
 from ddgs import DDGS
 from google import genai
 from google.genai import types
@@ -17,11 +18,33 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = 50
+MAX_LEADS_POR_EJECUCION = None  # None = revisa TODOS los leads de la etapa 5
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
+
+# Dominios de correo gratuitos: pueden ser de cualquiera, por eso se exige más evidencia.
+DOMINIOS_CORREO_GENERICOS = (
+    'gmail.com', 'hotmail.com', 'hotmail.com.ar', 'outlook.com', 'outlook.com.ar',
+    'yahoo.com', 'yahoo.com.ar', 'live.com', 'icloud.com', 'msn.com'
+)
+# Directorios y plataformas: sus correos propios nunca son del comercio.
+DOMINIOS_DIRECTORIO = (
+    'paginasamarillas', 'guiaoleo', 'cylex', 'infoisinfo', 'cybo.', 'yelp.',
+    'tripadvisor.', 'pedidosya.', 'rappi.', 'mercadolibre.', 'mapquest.',
+    'zoominfo.', 'ubereats.', 'indeed.', 'glassdoor.', 'linkedin.',
+    'facebook.com', 'instagram.com', 'wikipedia.org', 'google.com'
+)
+DOMINIOS_SOCIALES = ('facebook.com', 'instagram.com')
+EMAILS_BASURA = (
+    'sentry.io', 'wixpress.com', 'example.com', 'godaddy', 'squarespace',
+    'wordpress.com', 'domain.com', 'tuemail', 'tucorreo', 'tumail',
+    'usuario@', 'nombre@', 'ejemplo', 'email@email'
+)
+PALABRAS_CALLE_IGNORADAS = {'av', 'avenida', 'bv', 'boulevard', 'calle', 'pasaje', 'pje', 'ruta', 'diagonal'}
+PALABRAS_NOMBRE_GENERICAS = {'cordoba', 'argentina', 'sucursal', 'centro', 'nueva', 'nuevo', 'general'}
+
 
 class ResultadoValidacion(BaseModel):
     email_elegido: str
@@ -32,14 +55,18 @@ class ResultadoValidacion(BaseModel):
     datos_validos_y_verificados: bool
     motivo: str
 
+
 class BusquedaSinEvidencia(Exception):
     pass
+
 
 class CuotaGeminiAgotada(Exception):
     pass
 
+
 class ServicioGeminiTemporal(Exception):
     pass
+
 
 def generar_con_gemini(**kwargs):
     ultimo_error = None
@@ -62,11 +89,13 @@ def generar_con_gemini(**kwargs):
             raise
     raise ServicioGeminiTemporal(str(ultimo_error or "Gemini no disponible"))
 
+
 def conectar_odoo():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
+
 
 def normalizar_texto(valor):
     valor = (valor or '').lower()
@@ -106,6 +135,7 @@ def consultar_georef_direccion(lead, codigo_postal):
         ' ', direccion_consulta, flags=re.IGNORECASE
     )
     direccion_consulta = re.sub(r'\s+', ' ', direccion_consulta).strip(' ,.-')
+
     alturas = re.findall(r'\d+', direccion_consulta)
     if not direccion_consulta or not alturas:
         return 'UBICACION_INCIERTA', 'No se pudo separar calle y altura de la dirección de Odoo'
@@ -156,7 +186,6 @@ def consultar_georef_direccion(lead, codigo_postal):
             f"Georef confirmó Córdoba, departamento Capital, altura {altura_confirmada}"
             + (f", localidad censal {localidad}" if localidad else "")
         )
-
     if len(unicas) > 1:
         return 'UBICACION_INCIERTA', 'Georef devolvió más de una calle posible para esa altura'
     return 'UBICACION_INCIERTA', (
@@ -175,7 +204,6 @@ def clasificar_alcance_geografico(lead):
 
     if pais_nombre and pais_nombre not in ('argentina',):
         return 'FUERA_DE_ALCANCE'
-
     if provincia_nombre and provincia_nombre not in ('cordoba', 'cordoba capital'):
         return 'FUERA_DE_ALCANCE'
 
@@ -187,7 +215,6 @@ def clasificar_alcance_geografico(lead):
     }
     if ciudad and ciudad not in ciudades_capital:
         return 'FUERA_DE_ALCANCE'
-    # Si city está vacío o indica Córdoba Capital, Georef debe confirmar calle y altura.
 
     # Si la dirección identifica expresamente otra provincia o localidad, no consultar
     # el geocodificador para intentar reinterpretarla.
@@ -233,7 +260,6 @@ def clasificar_alcance_geografico(lead):
     if len(codigos) > 1:
         print(f"Ubicación pendiente: hay códigos postales contradictorios {codigos}", flush=True)
         return 'UBICACION_INCIERTA'
-
     codigo_postal = codigos[0] if codigos else ''
     if codigo_postal:
         # La primera letra del CPA identifica la provincia. X corresponde a Córdoba;
@@ -249,63 +275,7 @@ def clasificar_alcance_geografico(lead):
     )
     return alcance
 
-def evidencia_confirma_sucursal(lead, evidencia, resultado):
-    """Valida nombre + calle/altura + al menos un contacto en una misma fuente."""
-    nombre = normalizar_texto(lead.get('partner_name') or lead.get('name') or '')
-    direccion = str(lead.get('street') or '').split(',')[0].strip()
-    direccion_n = normalizar_texto(direccion)
-    if not nombre or not direccion_n:
-        return False, False, False
 
-    # Exigir calle y altura, pero no CP/localidad/país: muchas fuentes publican solo calle y número.
-    tokens = direccion_n.split()
-    numeros = re.findall(r'\d+', direccion_n)
-    if not numeros or len(tokens) < 2:
-        return False, False, False
-    altura = numeros[-1]
-    calle_tokens = [t for t in tokens if not t.isdigit()]
-    calle_clave = " ".join(calle_tokens)
-    # Normalizar abreviaturas frecuentes sin aceptar coincidencias por altura aislada.
-    calle_clave = re.sub(r'\b(av|avenida)\b', 'avenida', calle_clave)
-    calle_clave = re.sub(r'\b(bv|boulevard)\b', 'boulevard', calle_clave)
-
-    nombre_ok = telefono_ok = email_ok = False
-    telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
-    email_ia = (resultado.email_elegido or '').strip().lower()
-
-    for bloque in re.split(r'(?=\n=== FUENTE INDIVIDUAL ===)', evidencia):
-        bloque_n = normalizar_texto(bloque)
-        if nombre not in bloque_n:
-            # Permitir nombre corto solo si tiene al menos dos palabras significativas.
-            nombre_corto = normalizar_texto(limpiar_nombre_busqueda(lead.get('partner_name') or lead.get('name') or ''))
-            if len(nombre_corto.split()) < 2 or nombre_corto not in bloque_n:
-                continue
-
-        # La misma fuente debe contener la calle y altura de la sucursal.
-        if altura not in re.findall(r'\d+', bloque_n):
-            continue
-        calle_norm_bloque = re.sub(r'\b(av|avenida)\b', 'avenida', bloque_n)
-        calle_norm_bloque = re.sub(r'\b(bv|boulevard)\b', 'boulevard', calle_norm_bloque)
-        if not calle_clave or not all(t in calle_norm_bloque.split() for t in calle_clave.split()):
-            continue
-        nombre_ok = True
-
-        # Correo: tomar el elegido por Gemini solo si aparece literalmente en esta fuente.
-        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', bloque)
-        emails = [e.lower().strip('.,;:()[]{}<>') for e in emails]
-        emails = [e for e in emails if not any(x in e for x in ('example.com','sentry.io','wixpress.com'))]
-        if email_ia and email_ia in emails:
-            email_ok = True
-
-        # Teléfono: comparar el elegido por Gemini con números publicados en esa misma fuente.
-        if telefono_ia:
-            candidatos = re.findall(r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)', bloque)
-            for candidato in candidatos:
-                if limpiar_formato_celular(candidato) == telefono_ia:
-                    telefono_ok = True
-                    break
-
-    return nombre_ok, telefono_ok, email_ok
 def limpiar_nombre_busqueda(nombre):
     palabras_rubro = [
         r'\bdiet[eé]tica\b', r'\bverduler[ií]a\b', r'\bferreter[ií]a\b',
@@ -320,29 +290,238 @@ def limpiar_nombre_busqueda(nombre):
     limpio = re.sub(r'\s+', ' ', limpio).strip()
     return limpio if len(limpio) >= 3 else nombre
 
+
 def limpiar_formato_celular(numero):
     if not numero:
         return ""
     solo_digitos = re.sub(r'\D', '', str(numero))
     if not solo_digitos:
         return ""
+
     # Si el número ya viene internacional y contiene el 9 de móvil, conservarlo.
     if solo_digitos.startswith("549") and len(solo_digitos) == 13:
         return f"+{solo_digitos}"
+
     # No agregar el 9 móvil a teléfonos fijos: solo conservar el código internacional.
     if solo_digitos.startswith("54") and len(solo_digitos) == 12:
         return f"+{solo_digitos}"
+
     # Formato argentino con 0 + característica + 15 + número móvil.
     if solo_digitos.startswith("0") and len(solo_digitos) == 13 and solo_digitos[4:6] == "15":
         return f"+549{solo_digitos[1:4]}{solo_digitos[6:]}"
     if len(solo_digitos) == 12 and solo_digitos[3:5] == "15":
         return f"+549{solo_digitos[:3]}{solo_digitos[5:]}"
+
     # Formatos nacionales sin indicador de móvil: no inventar el prefijo 9.
     if solo_digitos.startswith("0") and len(solo_digitos) == 11:
         return f"+54{solo_digitos[1:]}"
     if len(solo_digitos) == 10:
         return f"+54{solo_digitos}"
+
     return f"+{solo_digitos}" if str(numero).strip().startswith("+") else solo_digitos
+
+
+# ---------------------------------------------------------------------------
+# Verificación de evidencia (reglas deterministas: nada se acepta si no aparece
+# escrito en una página que pertenezca claramente al comercio)
+# ---------------------------------------------------------------------------
+
+def email_util(email):
+    e = (email or '').lower().strip(".,;:()[]{}<>'\"")
+    if not e or e.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.js', '.css')):
+        return ''
+    if any(x in e for x in EMAILS_BASURA):
+        return ''
+    dominio = e.split('@')[-1]
+    if any(d in dominio for d in DOMINIOS_DIRECTORIO):
+        return ''
+    return e
+
+
+def emails_en_texto(texto):
+    encontrados = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', texto)
+    limpios = (email_util(e) for e in encontrados)
+    return list(dict.fromkeys(e for e in limpios if e))
+
+
+def separar_bloques(evidencia):
+    return re.split(r'(?=\n=== FUENTE INDIVIDUAL ===)', evidencia)
+
+
+def url_del_bloque(bloque):
+    m = re.search(r'URL:\s*(\S+)', bloque)
+    return m.group(1) if m else ''
+
+
+def nombres_del_lead(lead):
+    base = lead.get('partner_name') or lead.get('name') or ''
+    return normalizar_texto(base), normalizar_texto(limpiar_nombre_busqueda(base))
+
+
+def nombre_en_bloque(lead, bloque_n):
+    completo, corto = nombres_del_lead(lead)
+    if completo and completo in bloque_n:
+        return True
+    return bool(corto) and (len(corto.split()) >= 2 or len(corto) >= 6) and corto in bloque_n
+
+
+def calle_confirmada(lead, bloque_n):
+    """Calle y altura de la sucursal presentes en el mismo texto."""
+    direccion_n = normalizar_texto(str(lead.get('street') or '').split(',')[0])
+    numeros = re.findall(r'\d+', direccion_n)
+    if not numeros:
+        return False
+    altura = numeros[-1]
+    calle = [t for t in direccion_n.split() if not t.isdigit() and t not in PALABRAS_CALLE_IGNORADAS]
+    if not calle:
+        return False
+    palabras = set(bloque_n.split())
+    return altura in palabras and all(t in palabras for t in calle)
+
+
+def texto_coincide_con_nombre(lead, texto_compacto):
+    _, corto = nombres_del_lead(lead)
+    junto = corto.replace(' ', '')
+    if len(junto) >= 5 and junto in texto_compacto:
+        return True
+    tokens = [t for t in corto.split() if len(t) >= 3 and t not in PALABRAS_NOMBRE_GENERICAS]
+    return len(tokens) >= 2 and all(t in texto_compacto for t in tokens)
+
+
+def url_coincide_con_nombre(lead, url):
+    """True si la web (o el perfil de Facebook/Instagram) parece ser del propio comercio."""
+    if not url:
+        return False
+    p = urlparse(url)
+    host = p.netloc.lower().replace('www.', '')
+    if any(d in host for d in DOMINIOS_SOCIALES):
+        destino = re.sub(r'[^a-z0-9]', '', p.path.lower())
+    else:
+        if any(d in host for d in DOMINIOS_DIRECTORIO):
+            return False
+        destino = re.sub(r'[^a-z0-9]', '', host)
+    return texto_coincide_con_nombre(lead, destino)
+
+
+def email_coincide_con_nombre(lead, email):
+    dominio = email.split('@')[-1]
+    if dominio in DOMINIOS_CORREO_GENERICOS:
+        return False
+    return texto_coincide_con_nombre(lead, re.sub(r'[^a-z0-9]', '', dominio))
+
+
+def tipo_de_fuente(lead, bloque, bloque_n, telefono_lead):
+    """
+    Devuelve el tipo de fuente si el bloque pertenece al comercio (y no a un homónimo):
+      'oficial'  -> web o perfil cuyo nombre coincide con el del comercio y que cita Córdoba o la calle
+      'calle'    -> el nombre y la calle/altura aparecen juntos
+      'telefono' -> el nombre y el teléfono que ya tiene Odoo aparecen juntos
+    Si no, devuelve ''.
+    """
+    url = url_del_bloque(bloque)
+    tiene_calle = calle_confirmada(lead, bloque_n)
+    if url_coincide_con_nombre(lead, url) and (tiene_calle or 'cordoba' in bloque_n):
+        return 'oficial'
+    if not nombre_en_bloque(lead, bloque_n):
+        return ''
+    if tiene_calle:
+        return 'calle'
+    if telefono_lead and telefono_lead in re.sub(r'\D', '', bloque):
+        return 'telefono'
+    return ''
+
+
+def evaluar_evidencia(lead, evidencia, resultado, alcance):
+    """
+    Revisa toda la evidencia y devuelve:
+      email: (email, url) o None   -> email confirmado, listo para guardar
+      telefono: (telefono, url) o None
+      nombre_ok: bool
+      candidatos: emails vistos junto al nombre pero sin confirmar (solo para la nota)
+    """
+    prioridad = {'oficial': 0, 'calle': 1, 'telefono': 2}
+    telefono_lead = re.sub(r'\D', '', str(lead.get('phone') or ''))[-8:]
+    if len(telefono_lead) < 7:
+        telefono_lead = ''
+    telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
+    digitos_ia = re.sub(r'\D', '', telefono_ia)[-8:] if telefono_ia else ''
+    email_ia = email_util(resultado.email_elegido)
+    exigir_cordoba = (alcance == 'UBICACION_INCIERTA')
+
+    confirmados = {}      # email -> (rango, orden, url)
+    candidatos = {}       # email -> url
+    telefono_confirmado = None
+    nombre_ok = False
+    orden = 0
+
+    for bloque in separar_bloques(evidencia):
+        bloque_n = normalizar_texto(bloque)
+        url = url_del_bloque(bloque)
+        con_nombre = nombre_en_bloque(lead, bloque_n)
+        tipo = tipo_de_fuente(lead, bloque, bloque_n, telefono_lead)
+        emails_bloque = emails_en_texto(bloque)
+
+        if con_nombre:
+            for e in emails_bloque:
+                candidatos.setdefault(e, url)
+
+        if not tipo:
+            continue
+        if exigir_cordoba and 'cordoba' not in bloque_n:
+            continue
+        nombre_ok = True
+
+        host_bloque = urlparse(url).netloc.lower().replace('www.', '') if url else ''
+        for e in emails_bloque:
+            dominio = e.split('@')[-1]
+            if dominio in DOMINIOS_CORREO_GENERICOS:
+                # Gmail/Hotmail: puede ser de cualquiera, el nombre debe estar en la misma fuente.
+                aceptado = con_nombre
+                rango = prioridad[tipo] + 10
+            else:
+                aceptado = (
+                    email_coincide_con_nombre(lead, e)
+                    or (host_bloque and dominio in host_bloque)
+                    or tipo in ('calle', 'telefono')
+                )
+                rango = prioridad[tipo]
+            if aceptado and e not in confirmados:
+                orden += 1
+                confirmados[e] = (rango, orden, url)
+
+        if telefono_ia and not telefono_confirmado:
+            candidatos_tel = re.findall(
+                r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)',
+                bloque
+            )
+            whatsapp = re.findall(r'WHATSAPP PUBLICADO:\s*([0-9,\s]+)', bloque)
+            for grupo in whatsapp:
+                candidatos_tel.extend(x for x in grupo.split(',') if x.strip())
+            for c in candidatos_tel:
+                solo = re.sub(r'\D', '', c)
+                if len(solo) >= 8 and solo[-8:] == digitos_ia:
+                    telefono_confirmado = (telefono_ia, url)
+                    break
+
+    email_final = None
+    if email_ia and email_ia in confirmados:
+        email_final = (email_ia, confirmados[email_ia][2])
+    elif confirmados:
+        mejor = sorted(confirmados.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
+        email_final = (mejor[0], mejor[1][2])
+
+    sin_confirmar = [(e, u) for e, u in candidatos.items() if e not in confirmados][:3]
+    return {
+        'email': email_final,
+        'telefono': telefono_confirmado,
+        'nombre_ok': nombre_ok,
+        'candidatos': sin_confirmar,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Búsqueda en internet
+# ---------------------------------------------------------------------------
 
 def extraer_texto_de_url(url):
     """Descarga una página y extrae contenido, emails, WhatsApp y enlaces internos de contacto."""
@@ -356,12 +535,14 @@ def extraer_texto_de_url(url):
         response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
             return ""
-        from urllib.parse import urljoin
         html = response.text[:1500000]
+
         whatsapp_links = re.findall(r'(?:wa\.me/|whatsapp\.com/send\?phone=|whatsapp://send\?phone=)([0-9+\s-]+)', html, re.IGNORECASE)
         whatsapp_limpios = [re.sub(r'\D', '', w) for w in whatsapp_links if len(re.sub(r'\D', '', w)) >= 8]
+
         emails_html = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
-        emails_filtrados = sorted(set(e.lower() for e in emails_html if not e.lower().endswith(('.png','.jpg','.jpeg','.gif','.svg','.webp')) and not any(x in e.lower() for x in ('sentry.io','wixpress.com','example.com'))))
+        emails_filtrados = sorted(set(e.lower() for e in emails_html if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp')) and not any(x in e.lower() for x in ('sentry.io', 'wixpress.com', 'example.com'))))
+
         enlaces_contacto = []
         for href, label in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, re.I | re.S):
             texto_link = re.sub(r'<[^>]+>', ' ', label)
@@ -369,12 +550,14 @@ def extraer_texto_de_url(url):
                 destino = urljoin(url, href.split('#')[0])
                 if destino.startswith("http") and destino not in enlaces_contacto:
                     enlaces_contacto.append(destino)
+
         texto_limpio = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
         texto_limpio = re.sub(r'<style[^>]*>.*?</style>', ' ', texto_limpio, flags=re.DOTALL | re.IGNORECASE)
         texto_limpio = re.sub(r'<[^>]+>', ' ', texto_limpio)
         texto_limpio = re.sub(r'&nbsp;|&#160;', ' ', texto_limpio, flags=re.I)
         texto_limpio = re.sub(r'&amp;', '&', texto_limpio, flags=re.I)
         texto_limpio = re.sub(r'\s+', ' ', texto_limpio)
+
         extras = []
         if whatsapp_limpios:
             extras.append("[WHATSAPP PUBLICADO: " + ", ".join(sorted(set(whatsapp_limpios))) + "]")
@@ -386,6 +569,8 @@ def extraer_texto_de_url(url):
     except Exception as exc:
         print(f"No se pudo leer {url}: {exc}", flush=True)
         return ""
+
+
 def ejecutar_consulta_ddgs(query, max_res=7):
     try:
         resultados = DDGS().text(query, region="ar-es", max_results=max_res)
@@ -393,32 +578,37 @@ def ejecutar_consulta_ddgs(query, max_res=7):
     except Exception:
         return []
 
+
 def investigacion_profunda_con_google_search(lead):
     """Busca primero emails: buscador, web oficial, páginas internas y redes públicas."""
-    from urllib.parse import urlparse
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
     direccion = lead.get('street') or ''
     calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
-    ciudad = lead.get('city') or 'Córdoba Capital, Argentina'
+    telefono_odoo = re.sub(r'\D', '', str(lead.get('phone') or ''))
+
     base = f'"{nombre_corto}" "{calle_busqueda}" Córdoba Argentina' if calle_busqueda else f'"{nombre_corto}" Córdoba Argentina'
 
     reporte = []
     resultados_urls = []
     urls_vistas = set()
+
     dominios_no_utiles = (
-        'wikipedia.org','pornhub.com','xvideos.com','youtube.com','tiktok.com',
-        'linkedin.com','tripadvisor.','pedidosya.','rappi.','mercadolibre.',
-        'ubereats.','indeed.','glassdoor.','mapquest.','yelp.','zoominfo.'
+        'wikipedia.org', 'pornhub.com', 'xvideos.com', 'youtube.com', 'tiktok.com',
+        'linkedin.com', 'tripadvisor.', 'pedidosya.', 'rappi.', 'mercadolibre.',
+        'ubereats.', 'indeed.', 'glassdoor.', 'mapquest.', 'yelp.', 'zoominfo.'
     )
 
     consultas = [
+        (f'"{nombre_corto}" Córdoba sitio web oficial contacto', 8, "BÚSQUEDA DE SITIO OFICIAL"),
         (f'{base} email correo electrónico contacto', 8, "BÚSQUEDA PRIORITARIA DE EMAIL"),
         (f'{base} mail @gmail.com OR @hotmail.com OR @outlook.com OR @yahoo.com', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
         (f'"{nombre_corto}" "{calle_busqueda}" contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
         (f'"{nombre_corto}" Córdoba Facebook Instagram contacto email', 7, "BÚSQUEDA EN REDES SOCIALES"),
         (f'"{nombre_corto}" "{calle_busqueda}" "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
     ]
+    if len(telefono_odoo) >= 8:
+        consultas.append((f'"{nombre_corto}" "{telefono_odoo[-8:]}" Córdoba', 6, "BÚSQUEDA POR TELÉFONO CARGADO"))
 
     for query, limite, etiqueta in consultas:
         print(f"-> {etiqueta}: {query}", flush=True)
@@ -442,20 +632,36 @@ def investigacion_profunda_con_google_search(lead):
         link, titulo, cuerpo = item
         dominio = urlparse(link).netloc.lower()
         puntos = 0
-        if any(x in dominio for x in ('facebook.com','instagram.com')): puntos += 2
-        else: puntos += 5
-        if any(x in (titulo + " " + cuerpo).lower() for x in ('contacto','email','correo','teléfono','telefono')): puntos += 3
-        if calle_busqueda and normalizar_texto(calle_busqueda).split()[0] in normalizar_texto(titulo + " " + cuerpo): puntos += 3
-        if any(d in dominio for d in dominios_no_utiles): puntos -= 20
+        if url_coincide_con_nombre(lead, link):
+            puntos += 8
+        if any(x in dominio for x in ('facebook.com', 'instagram.com')):
+            puntos += 2
+        else:
+            puntos += 5
+        if any(x in (titulo + " " + cuerpo).lower() for x in ('contacto', 'email', 'correo', 'teléfono', 'telefono')):
+            puntos += 3
+        if calle_busqueda and normalizar_texto(calle_busqueda).split()[0] in normalizar_texto(titulo + " " + cuerpo):
+            puntos += 3
+        if any(d in dominio for d in dominios_no_utiles):
+            puntos -= 20
         return puntos
 
     resultados_urls.sort(key=puntuacion, reverse=True)
     urls_para_abrir = [x[0] for x in resultados_urls[:8]]
 
+    # En los sitios que parecen del comercio, probar también las páginas de contacto habituales.
+    extras_contacto = []
+    for link in urls_para_abrir:
+        p = urlparse(link)
+        if not any(d in p.netloc.lower() for d in DOMINIOS_SOCIALES) and url_coincide_con_nombre(lead, link):
+            raiz = f"{p.scheme}://{p.netloc}"
+            for ruta in ('/contacto', '/contact', '/contactanos', '/nosotros'):
+                extras_contacto.append(raiz + ruta)
+
     # Descargar páginas halladas y descubrir páginas internas de contacto.
-    pendientes = list(urls_para_abrir)
+    pendientes = list(dict.fromkeys(urls_para_abrir + extras_contacto))
     visitadas = set()
-    while pendientes and len(visitadas) < 12:
+    while pendientes and len(visitadas) < 16:
         url = pendientes.pop(0)
         if url in visitadas:
             continue
@@ -464,8 +670,8 @@ def investigacion_profunda_con_google_search(lead):
         contenido = extraer_texto_de_url(url)
         if contenido:
             reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
-            for enlace in re.findall(r'https?://[^\s|]+', contenido):
-                if any(k in enlace.lower() for k in ('contact','contacto','nosotros','about','empresa')):
+            for enlace in re.findall(r'https?://[^\s|\]]+', contenido):
+                if any(k in enlace.lower() for k in ('contact', 'contacto', 'nosotros', 'about', 'empresa')):
                     if enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
                         pendientes.insert(0, enlace)
         time.sleep(0.7)
@@ -474,6 +680,8 @@ def investigacion_profunda_con_google_search(lead):
     if not evidencia:
         raise BusquedaSinEvidencia("DuckDuckGo no entregó resultados ni páginas verificables.")
     return evidencia
+
+
 def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
@@ -481,34 +689,35 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
     ciudad = lead.get('city') or 'Córdoba'
     email_actual = lead.get('email_from') or 'VACÍO'
     telefono_actual = lead.get('phone') or 'VACÍO'
+    tipo_lead = lead.get('_etiquetas') or 'No especificado'
 
     prompt = f"""
-    Eres un investigador exhaustivo de comercios de Argentina. Tu prioridad número uno es encontrar y verificar el EMAIL público del comercio. No te conformes con el primer resultado ni abandones la búsqueda de email porque hayas encontrado un teléfono.
+Eres un investigador exhaustivo de comercios e instituciones de Argentina. Tu prioridad número uno es encontrar y verificar el EMAIL público de este lead. No te conformes con el primer resultado ni abandones la búsqueda de email porque hayas encontrado un teléfono.
 
-    DATOS EN ODOO:
-    - Nombre: {nombre_original} (nombre corto: {nombre_corto})
-    - Dirección de la sucursal: {direccion}
-    - Ciudad: {ciudad}
-    - Email actual: {email_actual}
-    - Teléfono actual: {telefono_actual}
+DATOS EN ODOO:
+- Nombre: {nombre_original} (nombre corto: {nombre_corto})
+- Tipo de lead (etiqueta): {tipo_lead}  (COMERCIO = negocio; GENERADOR = institución o empresa generadora; el rubro debe ser compatible con esa actividad)
+- Dirección de la sucursal: {direccion}
+- Ciudad: {ciudad}
+- Email actual: {email_actual}
+- Teléfono actual: {telefono_actual}
 
-    EVIDENCIA REUNIDA (resultados de búsqueda, HTML de webs y páginas internas):
-    {info_duckduckgo}
+EVIDENCIA REUNIDA (resultados de búsqueda, HTML de webs y páginas internas):
+{info_duckduckgo}
 
-    REGLAS:
-    1. EMAIL: revisa todos los resultados y especialmente las secciones [EMAILS PUBLICADOS EN EL HTML], páginas de Contacto, Nosotros, pie de página y perfiles públicos de Facebook/Instagram. Si aparece un email que pertenece inequívocamente al comercio o a la sucursal, devuelve email_elegido exactamente y email_verificado=TRUE. No uses correos técnicos, de plataformas, de terceros ni de negocios homónimos.
-    2. No marques email como no encontrado si la evidencia contiene un correo público claramente vinculado al comercio. El email es prioritario y debe buscarse aunque ya exista teléfono.
-    3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo usa un teléfono publicado y vinculado a la misma sucursal.
-    4. IDENTIDAD: el nombre y la calle/altura deben corresponder a este comercio y esta sucursal. No confundas sucursales, homónimos, marcas o localidades.
-    5. UBICACIÓN: solo Córdoba Capital, Córdoba, Argentina. Georef ya realiza la validación geográfica; no infieras la ubicación por el nombre de la ciudad.
-    6. RUBRO: debe ser compatible con el comercio de Odoo.
-    7. Nunca inventes ni completes datos por intuición. Usa únicamente la evidencia incluida.
-    8. coincide_ubicacion_y_rubro y datos_validos_y_verificados deben ser TRUE solo si identidad, sucursal/dirección y rubro están respaldados por evidencia concreta.
-    9. email_verificado y telefono_verificado son independientes. Devuelve ambos si hay evidencia. No es obligatorio encontrar los dos.
-    10. Si no hay email fiable, devuelve email_elegido="" y email_verificado=FALSE. Si no hay teléfono fiable, devuelve telefono_elegido="" y telefono_verificado=FALSE.
-    11. El motivo debe explicar qué email fue encontrado y en qué tipo de fuente, o qué impidió encontrarlo.
-    """
-
+REGLAS:
+1. EMAIL: revisa todos los resultados y especialmente las secciones [EMAILS PUBLICADOS EN EL HTML], páginas de Contacto, Nosotros, pie de página y perfiles públicos de Facebook/Instagram. Si aparece un email que pertenece inequívocamente a este lead, devuelve email_elegido exactamente como está escrito y email_verificado=TRUE. Los emails de Gmail, Hotmail, Outlook o Yahoo son válidos si están publicados en la web o perfil del propio lead, o junto a su nombre y dirección. No uses correos técnicos, de plataformas, de directorios, de terceros ni de negocios homónimos.
+2. No marques email como no encontrado si la evidencia contiene un correo público claramente vinculado al lead. El email es prioritario y debe buscarse aunque ya exista teléfono.
+3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo usa un teléfono publicado y vinculado a la misma sucursal.
+4. IDENTIDAD: el nombre y la sucursal deben corresponder a este lead. No confundas sucursales, homónimos, marcas o localidades.
+5. UBICACIÓN: solo Córdoba Capital, Córdoba, Argentina. No infieras la ubicación solo por el nombre de la ciudad.
+6. RUBRO: debe ser compatible con el lead de Odoo.
+7. Nunca inventes ni completes datos por intuición. Usa únicamente la evidencia incluida y copia los datos exactamente.
+8. coincide_ubicacion_y_rubro debe ser TRUE solo si la identidad y el rubro están respaldados por evidencia concreta. datos_validos_y_verificados debe ser TRUE solo si hay un email o teléfono verificado.
+9. email_verificado y telefono_verificado son independientes. Devuelve ambos si hay evidencia. No es obligatorio encontrar los dos.
+10. Si no hay email fiable, devuelve email_elegido="" y email_verificado=FALSE. Si no hay teléfono fiable, devuelve telefono_elegido="" y telefono_verificado=FALSE.
+11. El motivo debe explicar qué email fue encontrado y en qué tipo de fuente, o qué impidió encontrarlo.
+"""
     response = generar_con_gemini(
         model=MODELO_GEMINI,
         contents=prompt,
@@ -519,29 +728,48 @@ def analizar_lead_con_google_search_y_ia(lead, info_duckduckgo):
         ),
     )
     return response.parsed
+
+
+# Colores de la tarjeta en Odoo (sin color = todavía sin revisar)
+COLOR_PENDIENTE = 2       # naranja: revisado, falta confirmar
+COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital
+COLOR_APROBADO = 10       # verde: revisado y chequeado
+
+
+def marcar_color(models, uid, lead_id, color):
+    try:
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead_id], {'color': color}])
+    except Exception as exc:
+        print(f"No se pudo marcar el color del lead {lead_id}: {exc}", flush=True)
+
+
+def registrar_nota(models, uid, lead_id, nota):
+    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead_id]], {'body': nota})
+
+
 def ejecutar_agente():
     print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
 
-    # SOLO se leen leads ya existentes en la etapa Prospectos por Controlar.
-    # No se crean contactos, leads ni oportunidades nuevas.
+    # SOLO se leen leads ya existentes en la etapa Prospectos por Controlar
+    # (COMERCIO y GENERADOR conviven en esa etapa). No se crean contactos, leads
+    # ni oportunidades nuevas, y las etiquetas nunca se modifican.
     id_prospectos = 5
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id']
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids']
+
     # Trae todos los leads de etapa 5 y rota por los auditados más antiguos.
-    # Así los pendientes recientes no bloquean indefinidamente a los demás: cada
-    # ejecución toma hasta 50 y los que recibieron una nota nueva pasan al final.
     dominio = [['stage_id', '=', id_prospectos]]
     todos_los_leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
         [dominio],
         {'fields': campos, 'limit': 10000, 'order': 'id asc'}
     )
+
     mensajes_agente = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
         [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:']]],
         {'fields': ['res_id', 'date'], 'limit': 20000, 'order': 'date desc'}
     )
-
     ultima_auditoria = {}
     for mensaje in mensajes_agente:
         res_id = mensaje.get('res_id')
@@ -556,13 +784,27 @@ def ejecutar_agente():
             lead['id']
         )
     )
-    leads = todos_los_leads[:MAX_LEADS_POR_EJECUCION]
+
+    leads = todos_los_leads if not MAX_LEADS_POR_EJECUCION else todos_los_leads[:MAX_LEADS_POR_EJECUCION]
+
+    # Nombres de etiquetas (COMERCIO / GENERADOR): solo se leen, nunca se escriben.
+    ids_tags = sorted({t for l in leads for t in (l.get('tag_ids') or [])})
+    nombres_tags = {}
+    if ids_tags:
+        try:
+            for tag in models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.tag', 'read', [ids_tags], {'fields': ['name']}):
+                nombres_tags[tag['id']] = tag['name']
+        except Exception as exc:
+            print(f"No se pudieron leer las etiquetas: {exc}", flush=True)
+    for lead in leads:
+        lead['_etiquetas'] = ' / '.join(nombres_tags.get(t, '') for t in (lead.get('tag_ids') or []) if nombres_tags.get(t))
+
     con_auditoria_previa = sum(1 for lead in todos_los_leads if lead['id'] in ultima_auditoria)
     print(
         f"Auditoria de leads EXISTENTES en Prospectos por Controlar (etapa {id_prospectos}). "
         f"Total en etapa: {len(todos_los_leads)} | Con auditoria previa: {con_auditoria_previa} "
         f"| Sin auditoria previa: {len(todos_los_leads) - con_auditoria_previa} "
-        f"| Lote seleccionado: {len(leads)} | Maximo por ejecucion: {MAX_LEADS_POR_EJECUCION}. "
+        f"| Lote seleccionado: {len(leads)} | Se revisan todos los de la etapa. "
         f"Modelo: {MODELO_GEMINI}.",
         flush=True
     )
@@ -578,120 +820,118 @@ def ejecutar_agente():
     fuera_alcance = 0
 
     for lead in leads:
-        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
-
+        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         try:
             alcance = clasificar_alcance_geografico(lead)
+
             if alcance == 'FUERA_DE_ALCANCE':
+                provincia = lead.get('state_id')
+                pais = lead.get('country_id')
                 nota = (
                     "Agente de Verificación: FUERA DE ALCANCE. La dirección cargada en Odoo "
                     f"no corresponde a Córdoba Capital (ciudad: {lead.get('city') or 'sin ciudad'}, "
-                    f"provincia: {(lead.get('state_id') or ['', ''])[1] if isinstance(lead.get('state_id'), (list, tuple)) and len(lead.get('state_id')) > 1 else 'sin provincia'}, "
-                    f"país: {(lead.get('country_id') or ['', ''])[1] if isinstance(lead.get('country_id'), (list, tuple)) and len(lead.get('country_id')) > 1 else 'sin país'}). "
+                    f"provincia: {provincia[1] if isinstance(provincia, (list, tuple)) and len(provincia) > 1 else 'sin provincia'}, "
+                    f"país: {pais[1] if isinstance(pais, (list, tuple)) and len(pais) > 1 else 'sin país'}). "
                     "No se realizó búsqueda ni se modificaron datos."
                 )
-                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota})
+                registrar_nota(models, uid, lead['id'], nota)
+                marcar_color(models, uid, lead['id'], COLOR_FUERA_ALCANCE)
                 procesados += 1
                 fuera_alcance += 1
                 print(nota, flush=True)
                 continue
-            if alcance == 'UBICACION_INCIERTA':
-                nota = (
-                    "Agente de Verificación: PENDIENTE. No se pudo confirmar Córdoba Capital "
-                    "con la dirección/código postal mediante Georef. No se realizó búsqueda "
-                    "ni se modificaron datos para evitar aprobar otra localidad."
-                )
-                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota})
-                procesados += 1
-                pendientes += 1
-                print(nota, flush=True)
-                continue
 
+            # Si Georef no confirma la dirección exacta, igual se busca, pero en ese caso
+            # cada fuente debe nombrar Córdoba para poder aprobar (ver evaluar_evidencia).
             info_ddgs = investigacion_profunda_con_google_search(lead)
             resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
+
         except BusquedaSinEvidencia as e:
             fallas_busqueda += 1
             nota_error = f"Agente de Verificación: PENDIENTE. No se modificó el lead porque la búsqueda no devolvió evidencia suficiente: {e}"
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
+            registrar_nota(models, uid, lead['id'], nota_error)
+            marcar_color(models, uid, lead['id'], COLOR_PENDIENTE)
             print(f"BUSQUEDA SIN EVIDENCIA. No se modifica el lead y queda pendiente: {e}", flush=True)
             continue
         except CuotaGeminiAgotada as e:
             nota_error = f"Agente de Verificación: PENDIENTE. Ejecución detenida por límite de cuota de Gemini; no se modificaron los datos: {e}"
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
+            registrar_nota(models, uid, lead['id'], nota_error)
             print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
             break
         except ServicioGeminiTemporal as e:
             no_auditados += 1
             nota_error = f"Agente de Verificación: PENDIENTE. Gemini no estuvo disponible; no se modificaron los datos: {e}"
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
+            registrar_nota(models, uid, lead['id'], nota_error)
             print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}", flush=True)
             break
         except Exception as e:
             nota_error = f"Agente de Verificación: PENDIENTE. Error durante la auditoría; no se modificaron los datos: {e}"
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': nota_error})
-            print(f"Error de Gemini en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
+            registrar_nota(models, uid, lead['id'], nota_error)
+            print(f"Error en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
             pendientes += 1
             continue
 
-        email_final = (resultado.email_elegido or '').strip().lower()
-        telefono_formateado = limpiar_formato_celular(resultado.telefono_elegido)
+        evidencia = evaluar_evidencia(lead, info_ddgs, resultado, alcance)
+
         email_actual = (lead.get('email_from') or '').strip().lower()
         telefono_actual = limpiar_formato_celular(lead.get('phone'))
 
-        email_definitivo = email_final if email_final else email_actual
-        telefono_definitivo = telefono_formateado if telefono_formateado else telefono_actual
+        email_confirmado = evidencia['email']        # (email, url) o None
+        telefono_confirmado = evidencia['telefono']  # (telefono, url) o None
+        contacto_verificado = bool(email_confirmado or telefono_confirmado)
 
-        evidencia_nombre_direccion, evidencia_telefono, evidencia_email = evidencia_confirma_sucursal(
-            lead, info_ddgs, resultado
-        )
-        telefono_verificado = bool(
-            resultado.telefono_verificado and telefono_formateado and evidencia_telefono
-        )
-        email_verificado = bool(
-            resultado.email_verificado and email_final and evidencia_email
-        )
-        contacto_verificado = bool(telefono_verificado or email_verificado)
-        identidad_sucursal_verificada = bool(evidencia_nombre_direccion and contacto_verificado)
         aprobado_final = bool(
-            alcance == 'CORDOBA_CAPITAL' and
+            alcance in ('CORDOBA_CAPITAL', 'UBICACION_INCIERTA') and
             resultado.coincide_ubicacion_y_rubro and
-            resultado.datos_validos_y_verificados and
-            identidad_sucursal_verificada and
+            evidencia['nombre_ok'] and
             contacto_verificado
         )
 
-        if aprobado_final:
-            motivo_ajustado = resultado.motivo
-        else:
-            faltantes = []
-            if not contacto_verificado:
-                faltantes.append("no se confirmó email ni teléfono público en la misma fuente que identifica la sucursal")
-            if not resultado.coincide_ubicacion_y_rubro or not evidencia_nombre_direccion:
-                faltantes.append("nombre y calle/altura no demostrados en una misma fuente")
-            motivo_ajustado = f"{resultado.motivo} [NO APROBADO: {', '.join(faltantes) or 'validación insuficiente'}]."
-
-        print(
-            f"Resultado: Aprobado={aprobado_final} | Email IA={resultado.email_verificado} "
-            f"| Email evidencia={evidencia_email} | Teléfono IA={resultado.telefono_verificado} "
-            f"| Teléfono evidencia={evidencia_telefono} | Contacto confirmado={contacto_verificado} "
-            f"| Tel={telefono_definitivo} | Email={email_definitivo}",
-            flush=True
-        )
-        print(f"Detalle: {motivo_ajustado}", flush=True)
-
+        partes_nota = []
         valores_actualizar = {}
-        if evidencia_nombre_direccion and evidencia_email and email_final and email_final != email_actual and resultado.email_verificado:
-            valores_actualizar['email_from'] = email_final
-        if evidencia_nombre_direccion and evidencia_telefono and telefono_formateado and telefono_formateado != telefono_actual and resultado.telefono_verificado:
-            valores_actualizar['phone'] = telefono_formateado
+
+        if email_confirmado and email_confirmado[0] != email_actual:
+            valores_actualizar['email_from'] = email_confirmado[0]
+        if telefono_confirmado and telefono_confirmado[0] != telefono_actual:
+            valores_actualizar['phone'] = telefono_confirmado[0]
+        # Solo se actualizan datos de contacto y la etapa; nunca la web ni las etiquetas.
         if aprobado_final:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
+
+        if aprobado_final:
+            partes_nota.append("APROBADO.")
+        else:
+            partes_nota.append("PENDIENTE.")
+        if email_confirmado:
+            partes_nota.append(f"Email confirmado: {email_confirmado[0]} (fuente: {email_confirmado[1] or 'resultado de búsqueda'}).")
+        if telefono_confirmado:
+            partes_nota.append(f"Teléfono confirmado: {telefono_confirmado[0]} (fuente: {telefono_confirmado[1] or 'resultado de búsqueda'}).")
+        if not aprobado_final:
+            faltantes = []
+            if not contacto_verificado:
+                faltantes.append("no se confirmó email ni teléfono en una página que pertenezca claramente al comercio")
+            if not evidencia['nombre_ok']:
+                faltantes.append("el nombre no apareció junto a la calle, el teléfono cargado o una web propia")
+            if not resultado.coincide_ubicacion_y_rubro:
+                faltantes.append("no coincide ubicación o rubro")
+            partes_nota.append("No pasa a Chequeado: " + ", ".join(faltantes or ["validación insuficiente"]) + ".")
+            if evidencia['candidatos']:
+                lista = "; ".join(f"{e} (visto en {u or 'resultado de búsqueda'})" for e, u in evidencia['candidatos'])
+                partes_nota.append(f"Emails vistos sin confirmar, para revisar a mano: {lista}.")
+        if alcance == 'UBICACION_INCIERTA':
+            partes_nota.append("Georef no confirmó la dirección exacta; se exigió que cada fuente nombrara Córdoba.")
+        partes_nota.append(f"Detalle IA: {resultado.motivo}")
+
+        print(
+            f"Resultado: Aprobado={aprobado_final} | Email={email_confirmado} | Teléfono={telefono_confirmado}",
+            flush=True
+        )
 
         if valores_actualizar:
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
 
-        mensaje_nota = f"Agente de Verificación: {motivo_ajustado}"
-        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead['id']]], {'body': mensaje_nota})
+        registrar_nota(models, uid, lead['id'], "Agente de Verificación: " + " ".join(partes_nota))
+        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else COLOR_PENDIENTE)
 
         procesados += 1
         if aprobado_final:
@@ -705,6 +945,7 @@ def ejecutar_agente():
         f"| fallas_busqueda={fallas_busqueda} | no_auditados={len(leads)-procesados-fallas_busqueda}",
         flush=True
     )
+
 
 if __name__ == "__main__":
     ejecutar_agente()
