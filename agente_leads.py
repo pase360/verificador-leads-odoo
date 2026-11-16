@@ -115,6 +115,32 @@ def extraer_codigos_postales(lead):
     return list(dict.fromkeys(encontrados))
 
 
+def parte_con_altura(direccion):
+    """
+    De una dirección de Odoo ("Urca, José Roque Funes 1115 Local 2, X5000 Córdoba") devuelve
+    (texto de calle y número sin local/piso, palabras de la calle, altura). None si no hay.
+    """
+    for parte in str(direccion or '').split(','):
+        parte = re.sub(r'(?<![A-Z0-9])[A-Z]\d{4}(?:[A-Z]{3})?(?![A-Z0-9])', ' ', parte)
+        parte = re.sub(r'\b(loc(?:al)?|piso|planta|pb|dpto|depto|oficina|of|galer[ií]a|torre|entrepiso)\b.*$', ' ', parte, flags=re.I)
+        parte = re.sub(r'\b(Argentina|Córdoba|Cordoba|Capital)\s*$', ' ', parte, flags=re.I)
+        parte = re.sub(r'\s+', ' ', parte).strip(' ,.-')
+        calle, altura, con_letras = [], '', False
+        for t in normalizar_texto(parte).split():
+            if t.isdigit():
+                if con_letras:
+                    altura = t
+                    break
+                calle.append(t)
+            else:
+                con_letras = True
+                calle.append(t)
+        calle = [t for t in calle if t not in PALABRAS_CALLE_IGNORADAS]
+        if altura and calle:
+            return parte, calle, altura
+    return None
+
+
 def consultar_georef_direccion(lead, codigo_postal):
     """
     Normaliza únicamente calle y altura, como exige Georef.
@@ -127,21 +153,10 @@ def consultar_georef_direccion(lead, codigo_postal):
 
     # Georef requiere calle/altura, no localidad, provincia ni código postal.
     # En Odoo suelen estar separados por comas: "Av. Colón 52, X5000 Córdoba, Argentina".
-    direccion_consulta = direccion_original.split(',')[0].strip()
-    direccion_consulta = re.sub(
-        r'(?<![A-Z0-9])[A-Z]\d{4}[A-Z]{3}(?![A-Z0-9])|(?<![A-Z0-9])[A-Z]\d{4}(?![A-Z0-9])',
-        ' ', direccion_consulta, flags=re.IGNORECASE
-    )
-    direccion_consulta = re.sub(
-        r'\b(Argentina|Córdoba|Cordoba|Capital)\b',
-        ' ', direccion_consulta, flags=re.IGNORECASE
-    )
-    direccion_consulta = re.sub(r'\s+', ' ', direccion_consulta).strip(' ,.-')
-
-    alturas = re.findall(r'\d+', direccion_consulta)
-    if not direccion_consulta or not alturas:
+    parte = parte_con_altura(direccion_original)
+    if not parte:
         return 'UBICACION_INCIERTA', 'No se pudo separar calle y altura de la dirección de Odoo'
-    altura_esperada = alturas[-1]
+    direccion_consulta, _, altura_esperada = parte
 
     try:
         respuesta = requests.get(
@@ -281,7 +296,7 @@ def clasificar_alcance_geografico(lead):
 def limpiar_nombre_busqueda(nombre):
     # Quita la sucursal entre corchetes y lo que sigue a un guion largo: "Marca – Rubro [Barrio]" -> "Marca"
     nombre = re.sub(r'\[.*?\]', '', nombre or '')
-    partes = re.split(r'\s[–—-]\s', nombre, maxsplit=1)
+    partes = re.split(r'\s[–—-]\s|\s\|\s|\s::\s', nombre, maxsplit=1)
     if len(partes) == 2 and len(partes[0].strip()) >= 4:
         nombre = partes[0]
     nombre = nombre.strip()
@@ -296,7 +311,10 @@ def limpiar_nombre_busqueda(nombre):
     for patron in palabras_rubro:
         limpio = re.sub(patron, '', limpio, flags=re.IGNORECASE)
     limpio = re.sub(r'\s+', ' ', limpio).strip()
-    return limpio if len(limpio) >= 3 else nombre
+    limpio = limpio.strip(' ,.:;-|')
+    palabras = limpio.split()
+    huerfano = bool(palabras) and palabras[0].lower() in ('y', 'e', 'la', 'el', 'los', 'las', 'un', 'una', 'de', 'del')
+    return limpio if (len(palabras) >= 2 and len(limpio) >= 5 and not huerfano) else nombre.strip(' ,.:;-|')
 
 
 def limpiar_formato_celular(numero):
@@ -305,6 +323,8 @@ def limpiar_formato_celular(numero):
     solo_digitos = re.sub(r'\D', '', str(numero))
     if not solo_digitos:
         return ""
+    if solo_digitos.startswith("540") and len(solo_digitos) == 13:
+        solo_digitos = "54" + solo_digitos[3:]
 
     # Si el número ya viene internacional y contiene el 9 de móvil, conservarlo.
     if solo_digitos.startswith("549") and len(solo_digitos) == 13:
@@ -375,14 +395,10 @@ def nombre_en_bloque(lead, bloque_n):
 
 def calle_confirmada(lead, bloque_n):
     """Calle y altura de la sucursal presentes en el mismo texto."""
-    direccion_n = normalizar_texto(str(lead.get('street') or '').split(',')[0])
-    numeros = re.findall(r'\d+', direccion_n)
-    if not numeros:
+    parte = parte_con_altura(lead.get('street'))
+    if not parte:
         return False
-    altura = numeros[-1]
-    calle = [t for t in direccion_n.split() if not t.isdigit() and t not in PALABRAS_CALLE_IGNORADAS]
-    if not calle:
-        return False
+    _, calle, altura = parte
     palabras = set(bloque_n.split())
     return altura in palabras and all(t in palabras for t in calle)
 
@@ -446,6 +462,10 @@ def tipo_de_fuente(lead, bloque, bloque_n, telefono_lead):
 PATRON_TELEFONO = re.compile(
     r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)'
 )
+def es_telefono_cordoba(formateado):
+    return bool(re.match(r'^(549|54)?351', re.sub(r'\D', '', formateado or '')))
+
+
 PALABRAS_TELEFONO = ('tel', 'cel', 'whats', 'wsp', 'wpp', 'contact', 'llam', 'consult', 'ventas', 'pedidos')
 
 
@@ -463,13 +483,15 @@ def telefonos_en_texto(bloque):
         con_prefijo = crudo.strip().startswith('+54') or solo.startswith(('54', '0351', '351'))
         if con_palabra or con_prefijo:
             formateado = limpiar_formato_celular(crudo)
-            if formateado:
+            if formateado and es_telefono_cordoba(formateado):
                 encontrados.append((formateado, m.start()))
     for grupo in re.findall(r'WHATSAPP PUBLICADO:\s*([0-9,\s]+)', bloque):
         for n in grupo.split(','):
             solo = re.sub(r'\D', '', n)
             if len(solo) >= 10:
-                encontrados.append(('+' + solo if solo.startswith('54') else limpiar_formato_celular(solo), 10 ** 8))
+                fmt = '+' + solo if solo.startswith('54') else limpiar_formato_celular(solo)
+                if es_telefono_cordoba(fmt):
+                    encontrados.append((fmt, 10 ** 8))
     return encontrados
 
 
@@ -644,19 +666,25 @@ def extraer_texto_de_url(url):
 
 
 def ejecutar_consulta_ddgs(query, max_res=7):
-    try:
-        resultados = DDGS().text(query, region="ar-es", max_results=max_res)
-        return resultados if resultados else []
-    except Exception:
-        return []
+    for intento in range(2):
+        try:
+            resultados = DDGS().text(query, region="ar-es", max_results=max_res)
+            if resultados:
+                return resultados
+        except Exception:
+            pass
+        time.sleep(4)
+    return []
 
 
-def investigacion_profunda_con_google_search(lead):
+def investigacion_profunda_con_google_search(lead, reintento=True):
     """Busca primero emails: buscador, web oficial, páginas internas y redes públicas."""
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
     nombre_corto = limpiar_nombre_busqueda(nombre_original)
     direccion = lead.get('street') or ''
-    calle_busqueda = direccion.split(',')[0].strip() if direccion else ''
+    parte_dir = parte_con_altura(direccion)
+    calle_busqueda = parte_dir[0] if parte_dir else ''
+    calle_q = f' "{calle_busqueda}"' if calle_busqueda else ''
     telefono_odoo = re.sub(r'\D', '', str(lead.get('phone') or ''))
 
     base = f'"{nombre_corto}" "{calle_busqueda}" Córdoba Argentina' if calle_busqueda else f'"{nombre_corto}" Córdoba Argentina'
@@ -675,11 +703,11 @@ def investigacion_profunda_con_google_search(lead):
         (f'"{nombre_corto}" Córdoba sitio web oficial contacto', 8, "BÚSQUEDA DE SITIO OFICIAL"),
         (f'{base} email correo electrónico contacto', 8, "BÚSQUEDA PRIORITARIA DE EMAIL"),
         (f'{base} correo gmail hotmail', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
-        (f'"{nombre_corto}" "{calle_busqueda}" contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
+        (f'"{nombre_corto}"{calle_q} contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
         (f'"{nombre_corto}" Córdoba Facebook Instagram contacto email', 7, "BÚSQUEDA EN REDES SOCIALES"),
-        (f'"{nombre_corto}" "{calle_busqueda}" "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
+        (f'"{nombre_corto}"{calle_q} "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
     ]
-    if len(telefono_odoo) >= 8:
+    if len(telefono_odoo) >= 8 and len(set(telefono_odoo[-8:])) > 2:
         consultas.append((f'"{nombre_corto}" "{telefono_odoo[-8:]}" Córdoba', 6, "BÚSQUEDA POR TELÉFONO CARGADO"))
 
     for query, limite, etiqueta in consultas:
@@ -750,12 +778,17 @@ def investigacion_profunda_con_google_search(lead):
             reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
             for enlace in re.findall(r'https?://[^\s|\]]+', contenido):
                 if any(k in enlace.lower() for k in ('contact', 'contacto', 'nosotros', 'about', 'empresa')):
-                    if enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
+                    if url_coincide_con_nombre(lead, url) and enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
                         pendientes.insert(0, enlace)
         time.sleep(0.7)
 
     evidencia = "\n\n".join(reporte).strip()
     if not evidencia:
+        if reintento:
+            # Casi siempre es un bloqueo momentáneo del buscador: se espera y se intenta una vez más.
+            print("Sin resultados; se espera 30 segundos y se reintenta la búsqueda.", flush=True)
+            time.sleep(30)
+            return investigacion_profunda_con_google_search(lead, reintento=False)
         raise BusquedaSinEvidencia("DuckDuckGo no entregó resultados ni páginas verificables.")
     return evidencia
 
@@ -811,7 +844,9 @@ REGLAS:
 # Colores de la tarjeta en Odoo (sin color = todavía sin revisar)
 COLOR_PENDIENTE = 2       # naranja: revisado, falta confirmar
 COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital
-COLOR_APROBADO = 10       # verde: revisado y chequeado
+COLOR_APROBADO = 10       # verde: revisado y chequeado, con email
+COLOR_SOLO_WHATSAPP = 3   # amarillo: chequeado pero sin email (solo WhatsApp)
+DIAS_REINTENTO_SIN_EMAIL = 0  # 0 = los amarillos se vuelven a revisar en cada corrida
 
 
 def marcar_color(models, uid, lead_id, color):
@@ -833,15 +868,27 @@ def ejecutar_agente():
     # (COMERCIO y GENERADOR conviven en esa etapa). No se crean contactos, leads
     # ni oportunidades nuevas, y las etiquetas nunca se modifican.
     id_prospectos = 5
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids']
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color']
 
     # Trae todos los leads de etapa 5 y rota por los auditados más antiguos.
-    dominio = [['stage_id', '=', id_prospectos]]
-    todos_los_leads = models.execute_kw(
-        ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-        [dominio],
-        {'fields': campos, 'limit': 10000, 'order': 'id asc'}
-    )
+    dominio = [
+        '|', ['stage_id', '=', id_prospectos],
+        '&', ['stage_id', '=', ID_ETAPA_CHEQUEADO], ['color', '=', COLOR_SOLO_WHATSAPP]
+    ]
+    try:
+        todos_los_leads = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
+            [dominio],
+            {'fields': campos, 'limit': 10000, 'order': 'id asc'}
+        )
+    except Exception as exc:
+        # Si esta versión de Odoo no tiene el campo de color, se revisa solo la etapa 5.
+        print(f"No se pudo usar el color en la consulta ({exc}); se revisa solo la etapa {id_prospectos}.", flush=True)
+        todos_los_leads = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
+            [[['stage_id', '=', id_prospectos]]],
+            {'fields': [c for c in campos if c != 'color'], 'limit': 10000, 'order': 'id asc'}
+        )
 
     mensajes_agente = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
@@ -854,6 +901,16 @@ def ejecutar_agente():
         fecha = mensaje.get('date') or ''
         if res_id and (res_id not in ultima_auditoria or fecha > ultima_auditoria[res_id]):
             ultima_auditoria[res_id] = fecha
+
+    # Los amarillos (ya en Chequeado, sin email) solo se reintentan cada 7 días.
+    limite_reintento = (datetime.now(timezone.utc) - timedelta(days=DIAS_REINTENTO_SIN_EMAIL)).strftime('%Y-%m-%d %H:%M:%S')
+    def _etapa_id(l):
+        st = l.get('stage_id')
+        return st[0] if isinstance(st, (list, tuple)) and st else st
+    todos_los_leads = [
+        l for l in todos_los_leads
+        if _etapa_id(l) == id_prospectos or ultima_auditoria.get(l['id'], '') < limite_reintento
+    ]
 
     # Sin auditoría previa primero; luego los auditados hace más tiempo.
     todos_los_leads.sort(
@@ -896,6 +953,7 @@ def ejecutar_agente():
     fallas_busqueda = 0
     no_auditados = 0
     fuera_alcance = 0
+    sin_email = 0
 
     for lead in leads:
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
@@ -986,6 +1044,14 @@ def ejecutar_agente():
             contacto_verificado
         )
 
+        # Sin email pero con WhatsApp de Córdoba ya cargado: pasa a Chequeado en amarillo.
+        # El agente vuelve a buscar su email cada 7 días.
+        solo_whatsapp = bool(
+            not aprobado_final and
+            alcance in ('CORDOBA_CAPITAL', 'UBICACION_INCIERTA') and
+            re.match(r'^\+549351\d{7}$', telefono_actual or '')
+        )
+
         partes_nota = []
         extra_nota = []
         valores_actualizar = {}
@@ -999,10 +1065,15 @@ def ejecutar_agente():
             if telefono_actual:
                 extra_nota.append(f"El teléfono anterior era {telefono_actual}.")
         # Solo se actualizan datos de contacto y la etapa; nunca la web ni las etiquetas.
-        if aprobado_final:
+        if aprobado_final or solo_whatsapp:
             valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
 
-        partes_nota.append("APROBADO." if aprobado_final else "PENDIENTE.")
+        if aprobado_final:
+            partes_nota.append("APROBADO.")
+        elif solo_whatsapp:
+            partes_nota.append(f"APROBADO SIN EMAIL. No se encontró un email público; pasa a Chequeado solo con el WhatsApp ya cargado ({telefono_actual}). Se volverá a buscar el email.")
+        else:
+            partes_nota.append("PENDIENTE.")
         if email_confirmado:
             partes_nota.append(f"Email confirmado: {email_confirmado[0]} (fuente: {email_confirmado[1] or 'resultado de búsqueda'}).")
             if evidencia['otros_emails']:
@@ -1012,7 +1083,7 @@ def ejecutar_agente():
         partes_nota.extend(extra_nota)
         if sin_aplicar:
             partes_nota.append("NO se cambió porque no salió de la web propia del comercio y Odoo ya tenía otro dato: " + "; ".join(sin_aplicar) + ".")
-        if not aprobado_final:
+        if not aprobado_final and not solo_whatsapp:
             faltantes = []
             if not contacto_verificado:
                 faltantes.append("no se confirmó email ni teléfono en una página que pertenezca claramente al comercio")
@@ -1036,16 +1107,18 @@ def ejecutar_agente():
             models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
 
         registrar_nota(models, uid, lead['id'], "Agente de Verificación: " + " ".join(partes_nota))
-        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else COLOR_PENDIENTE)
+        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else (COLOR_SOLO_WHATSAPP if solo_whatsapp else COLOR_PENDIENTE))
 
         procesados += 1
         if aprobado_final:
             aprobados += 1
+        elif solo_whatsapp:
+            sin_email += 1
         else:
             pendientes += 1
 
     print(
-        f"\nRESUMEN: encontrados={len(leads)} | auditados={procesados} | aprobados={aprobados} "
+        f"\nRESUMEN: encontrados={len(leads)} | auditados={procesados} | aprobados_con_email={aprobados} | aprobados_solo_whatsapp={sin_email} "
         f"| pendientes_auditados={pendientes} | fuera_alcance={fuera_alcance} "
         f"| fallas_busqueda={fallas_busqueda} | no_auditados={len(leads)-procesados-fallas_busqueda}",
         flush=True
