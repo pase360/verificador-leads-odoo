@@ -20,9 +20,22 @@ ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_CHEQUEADO = 7  # Etapa destino
-MAX_LEADS_POR_EJECUCION = None  # None = revisa TODOS los leads de la etapa 5
+MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
+
+# --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
+TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
+MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
+DIAS_REINTENTO_PENDIENTES = 1             # Un lead pendiente en etapa 5 no se vuelve a revisar antes de este tiempo
+DIAS_REINTENTO_SIN_EMAIL = 7              # Los amarillos (Chequeado sin email) se vuelven a revisar cada 7 días
+
+# True  = conserva el comportamiento actual: un lead sin evidencia pero con WhatsApp +549351 ya cargado
+#         pasa a Chequeado en amarillo, SIN que ese número haya sido verificado en ninguna página.
+# False = esos leads quedan en Prospectos hasta que el número se confirme con evidencia.
+PASAR_SOLO_WHATSAPP_SIN_VERIFICAR = True
+
+INICIO_EJECUCION = time.time()
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -46,6 +59,7 @@ EMAILS_BASURA = (
 )
 PALABRAS_CALLE_IGNORADAS = {'av', 'avenida', 'bv', 'boulevard', 'calle', 'pasaje', 'pje', 'ruta', 'diagonal'}
 PALABRAS_NOMBRE_GENERICAS = {'cordoba', 'argentina', 'sucursal', 'centro', 'nueva', 'nuevo', 'general'}
+PALABRAS_VACIAS_NOMBRE = {'en', 'de', 'del', 'la', 'el', 'los', 'las', 'y', 'e', 'un', 'una', 'con', 'para'}
 
 
 class ResultadoValidacion(BaseModel):
@@ -293,13 +307,15 @@ def clasificar_alcance_geografico(lead):
     return alcance
 
 
-def limpiar_nombre_busqueda(nombre):
-    # Quita la sucursal entre corchetes y lo que sigue a un guion largo: "Marca – Rubro [Barrio]" -> "Marca"
-    nombre = re.sub(r'\[.*?\]', '', nombre or '')
-    partes = re.split(r'\s[–—-]\s|\s\|\s|\s::\s', nombre, maxsplit=1)
-    if len(partes) == 2 and len(partes[0].strip()) >= 4:
-        nombre = partes[0]
-    nombre = nombre.strip()
+def _nombre_es_util(texto):
+    """False si el nombre quedó vacío de contenido real (solo 'en Córdoba', 'de la', etc.)."""
+    tokens = [t for t in normalizar_texto(texto).split()
+              if t not in PALABRAS_VACIAS_NOMBRE and t not in PALABRAS_NOMBRE_GENERICAS]
+    return any(len(t) >= 3 for t in tokens)
+
+
+def _quitar_rubro(nombre):
+    nombre = (nombre or '').strip()
     palabras_rubro = [
         r'\bdiet[eé]tica\b', r'\bverduler[ií]a\b', r'\bferreter[ií]a\b',
         r'\bflorer[ií]a\b', r'\bfarmacia\b', r'\bcotill[oó]n\b',
@@ -315,6 +331,22 @@ def limpiar_nombre_busqueda(nombre):
     palabras = limpio.split()
     huerfano = bool(palabras) and palabras[0].lower() in ('y', 'e', 'la', 'el', 'los', 'las', 'un', 'una', 'de', 'del')
     return limpio if (len(palabras) >= 2 and len(limpio) >= 5 and not huerfano) else nombre.strip(' ,.:;-|')
+
+
+def limpiar_nombre_busqueda(nombre):
+    # Quita la sucursal entre corchetes. Si hay un guion largo ("Marca – Rubro"), prueba primero
+    # la parte anterior y, si esa quedó sin contenido real (ej. "en Córdoba"), prueba la posterior.
+    nombre = re.sub(r'\[.*?\]', '', nombre or '').strip()
+    partes = [p.strip() for p in re.split(r'\s[–—-]\s|\s\|\s|\s::\s', nombre, maxsplit=1)]
+    if len(partes) == 2 and len(partes[0]) >= 4:
+        candidatos = [partes[0], partes[1]]
+    else:
+        candidatos = [nombre]
+    for candidato in candidatos:
+        resultado = _quitar_rubro(candidato)
+        if resultado and _nombre_es_util(resultado):
+            return resultado
+    return nombre.strip(' ,.:;-|')
 
 
 def limpiar_formato_celular(numero):
@@ -506,7 +538,9 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
     Regla clave: si la web propia del comercio publica un dato, manda sobre redes y directorios.
     """
     prioridad = {'oficial': 0, 'calle': 1}
-    telefono_lead = re.sub(r'\D', '', str(lead.get('phone') or ''))[-8:]
+    # Se usan los últimos 7 dígitos (sin código de área): así coincide aunque la página
+    # lo escriba como "351 702-2266", "0351 15 702 2266" o "+54 9 351 7022266".
+    telefono_lead = re.sub(r'\D', '', str(lead.get('phone') or ''))[-7:]
     if len(telefono_lead) < 7:
         telefono_lead = ''
     telefono_ia = limpiar_formato_celular(resultado.telefono_elegido)
@@ -665,15 +699,20 @@ def extraer_texto_de_url(url):
         return ""
 
 
+# Según la prueba hecha desde GitHub: DuckDuckGo directo está bloqueado, "auto" y Yandex responden,
+# Google/Bing/Yahoo responden a medias. Se prueban en este orden hasta que uno devuelva resultados.
+BACKENDS_BUSQUEDA = ["auto", "yandex", "google", "bing", "yahoo"]
+
+
 def ejecutar_consulta_ddgs(query, max_res=7):
-    for intento in range(2):
+    for backend in BACKENDS_BUSQUEDA:
         try:
-            resultados = DDGS().text(query, region="ar-es", max_results=max_res)
+            resultados = DDGS().text(query, region="ar-es", max_results=max_res, backend=backend)
             if resultados:
                 return resultados
         except Exception:
             pass
-        time.sleep(4)
+        time.sleep(1.5)
     return []
 
 
@@ -699,16 +738,23 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
         'ubereats.', 'indeed.', 'glassdoor.', 'mapquest.', 'yelp.', 'zoominfo.'
     )
 
+    # Se quitó la búsqueda "correo gmail hotmail": repetía la de email y aumentaba el riesgo de bloqueo.
     consultas = [
         (f'"{nombre_corto}" Córdoba sitio web oficial contacto', 8, "BÚSQUEDA DE SITIO OFICIAL"),
         (f'{base} email correo electrónico contacto', 8, "BÚSQUEDA PRIORITARIA DE EMAIL"),
-        (f'{base} correo gmail hotmail', 8, "BÚSQUEDA DE CORREOS PÚBLICOS"),
         (f'"{nombre_corto}"{calle_q} contacto teléfono email', 8, "BÚSQUEDA DE IDENTIDAD Y CONTACTO"),
         (f'"{nombre_corto}" Córdoba Facebook Instagram contacto email', 7, "BÚSQUEDA EN REDES SOCIALES"),
         (f'"{nombre_corto}"{calle_q} "@"', 7, "BÚSQUEDA EXACTA DE EMAIL"),
     ]
-    if len(telefono_odoo) >= 8 and len(set(telefono_odoo[-8:])) > 2:
-        consultas.append((f'"{nombre_corto}" "{telefono_odoo[-8:]}" Córdoba', 6, "BÚSQUEDA POR TELÉFONO CARGADO"))
+    # Teléfono: se busca por los últimos 7 dígitos (sin código de área), separados como los escriben
+    # las páginas ("702 2266"), no pegados con el código de área como antes.
+    ultimos7 = telefono_odoo[-7:]
+    if len(ultimos7) == 7 and len(set(ultimos7)) > 2:
+        consultas.append((f'"{nombre_corto}" "{ultimos7[:3]} {ultimos7[3:]}" Córdoba', 6, "BÚSQUEDA POR TELÉFONO CARGADO"))
+
+    # En el reintento (después de un vacío total) solo se repiten las 3 primeras, no todas.
+    if not reintento:
+        consultas = consultas[:3]
 
     for query, limite, etiqueta in consultas:
         print(f"-> {etiqueta}: {query}", flush=True)
@@ -725,7 +771,7 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
                     resultados_urls.append((link, titulo, cuerpo))
         if bloques:
             reporte.append(f"=== {etiqueta} ===\n" + "\n".join(bloques))
-        time.sleep(1)
+        time.sleep(2)
 
     # Priorizar sitios propios; los resultados de redes quedan como evidencia de perfil.
     def puntuacion(item):
@@ -785,7 +831,7 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
     evidencia = "\n\n".join(reporte).strip()
     if not evidencia:
         if reintento:
-            # Casi siempre es un bloqueo momentáneo del buscador: se espera y se intenta una vez más.
+            # Casi siempre es un bloqueo momentáneo del buscador: se espera y se intenta una vez más (versión corta).
             print("Sin resultados; se espera 30 segundos y se reintenta la búsqueda.", flush=True)
             time.sleep(30)
             return investigacion_profunda_con_google_search(lead, reintento=False)
@@ -846,7 +892,6 @@ COLOR_PENDIENTE = 2       # naranja: revisado, falta confirmar
 COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital
 COLOR_APROBADO = 10       # verde: revisado y chequeado, con email
 COLOR_SOLO_WHATSAPP = 3   # amarillo: chequeado pero sin email (solo WhatsApp)
-DIAS_REINTENTO_SIN_EMAIL = 0  # 0 = los amarillos se vuelven a revisar en cada corrida
 
 
 def marcar_color(models, uid, lead_id, color):
@@ -870,7 +915,7 @@ def ejecutar_agente():
     id_prospectos = 5
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color']
 
-    # Trae todos los leads de etapa 5 y rota por los auditados más antiguos.
+    # Trae los leads de etapa 5 y los amarillos de Chequeado; luego se filtran por antigüedad de auditoría.
     dominio = [
         '|', ['stage_id', '=', id_prospectos],
         '&', ['stage_id', '=', ID_ETAPA_CHEQUEADO], ['color', '=', COLOR_SOLO_WHATSAPP]
@@ -902,15 +947,25 @@ def ejecutar_agente():
         if res_id and (res_id not in ultima_auditoria or fecha > ultima_auditoria[res_id]):
             ultima_auditoria[res_id] = fecha
 
-    # Los amarillos (ya en Chequeado, sin email) solo se reintentan cada 7 días.
-    limite_reintento = (datetime.now(timezone.utc) - timedelta(days=DIAS_REINTENTO_SIN_EMAIL)).strftime('%Y-%m-%d %H:%M:%S')
+    ahora = datetime.now(timezone.utc)
+    limite_pendientes = (ahora - timedelta(days=DIAS_REINTENTO_PENDIENTES)).strftime('%Y-%m-%d %H:%M:%S')
+    limite_amarillos = (ahora - timedelta(days=DIAS_REINTENTO_SIN_EMAIL)).strftime('%Y-%m-%d %H:%M:%S')
+
     def _etapa_id(l):
         st = l.get('stage_id')
         return st[0] if isinstance(st, (list, tuple)) and st else st
-    todos_los_leads = [
-        l for l in todos_los_leads
-        if _etapa_id(l) == id_prospectos or ultima_auditoria.get(l['id'], '') < limite_reintento
-    ]
+
+    total_etapa_5 = sum(1 for l in todos_los_leads if _etapa_id(l) == id_prospectos)
+    total_amarillos = len(todos_los_leads) - total_etapa_5
+
+    # Un lead se revisa solo si nunca fue auditado o si pasó el tiempo de espera de su grupo.
+    # Esto evita volver a procesar en cada corrida los mismos leads que ya se revisaron hoy.
+    def _toca_revisar(l):
+        ultima = ultima_auditoria.get(l['id'], '')
+        limite = limite_pendientes if _etapa_id(l) == id_prospectos else limite_amarillos
+        return ultima < limite
+
+    todos_los_leads = [l for l in todos_los_leads if _toca_revisar(l)]
 
     # Sin auditoría previa primero; luego los auditados hace más tiempo.
     todos_los_leads.sort(
@@ -934,12 +989,11 @@ def ejecutar_agente():
     for lead in leads:
         lead['_etiquetas'] = ' / '.join(nombres_tags.get(t, '') for t in (lead.get('tag_ids') or []) if nombres_tags.get(t))
 
-    con_auditoria_previa = sum(1 for lead in todos_los_leads if lead['id'] in ultima_auditoria)
+    sin_auditoria_previa = sum(1 for lead in todos_los_leads if lead['id'] not in ultima_auditoria)
     print(
-        f"Auditoria de leads EXISTENTES en Prospectos por Controlar (etapa {id_prospectos}). "
-        f"Total en etapa: {len(todos_los_leads)} | Con auditoria previa: {con_auditoria_previa} "
-        f"| Sin auditoria previa: {len(todos_los_leads) - con_auditoria_previa} "
-        f"| Lote seleccionado: {len(leads)} | Se revisan todos los de la etapa. "
+        f"Etapa {id_prospectos}: {total_etapa_5} leads | Amarillos en Chequeado: {total_amarillos} | "
+        f"Les toca revisión: {len(todos_los_leads)} (nunca auditados: {sin_auditoria_previa}) | "
+        f"Lote de esta corrida: {len(leads)} | Tiempo máximo: {TIEMPO_MAXIMO_SEGUNDOS // 60} min | "
         f"Modelo: {MODELO_GEMINI}.",
         flush=True
     )
@@ -951,11 +1005,17 @@ def ejecutar_agente():
     pendientes = 0
     procesados = 0
     fallas_busqueda = 0
-    no_auditados = 0
     fuera_alcance = 0
     sin_email = 0
+    sin_buscador_seguidos = 0
+    motivo_corte = ''
 
     for lead in leads:
+        if time.time() - INICIO_EJECUCION > TIEMPO_MAXIMO_SEGUNDOS:
+            motivo_corte = "TIEMPO MÁXIMO ALCANZADO. Se corta limpio; los leads restantes se toman en la próxima corrida."
+            print(f"\n{motivo_corte}", flush=True)
+            break
+
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         try:
             alcance = clasificar_alcance_geografico(lead)
@@ -980,6 +1040,7 @@ def ejecutar_agente():
             # Si Georef no confirma la dirección exacta, igual se busca, pero en ese caso
             # cada fuente debe nombrar Córdoba para poder aprobar (ver evaluar_evidencia).
             info_ddgs = investigacion_profunda_con_google_search(lead)
+            sin_buscador_seguidos = 0  # el buscador respondió: se reinicia el contador de bloqueo
             # Gemini solo se consulta si la búsqueda halló algún mail o teléfono que confirmar:
             # si no hay nada, no puede aportar y se ahorra cuota diaria.
             vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
@@ -990,18 +1051,27 @@ def ejecutar_agente():
                 resultado = vacio
 
         except BusquedaSinEvidencia as e:
+            # El buscador no devolvió NADA para este lead: casi seguro está bloqueado.
+            # No se escribe nota ni color (así el lead no se marca como auditado y no se
+            # acumulan notas repetidas); simplemente se salta y se cuenta.
             fallas_busqueda += 1
-            nota_error = f"Agente de Verificación: PENDIENTE. No se modificó el lead porque la búsqueda no devolvió evidencia suficiente: {e}"
-            registrar_nota(models, uid, lead['id'], nota_error)
-            marcar_color(models, uid, lead['id'], COLOR_PENDIENTE)
-            print(f"BUSQUEDA SIN EVIDENCIA. No se modifica el lead y queda pendiente: {e}", flush=True)
+            sin_buscador_seguidos += 1
+            print(f"BUSQUEDA SIN RESULTADOS ({sin_buscador_seguidos}/{MAX_SIN_BUSCADOR_SEGUIDOS}). El lead no se modifica: {e}", flush=True)
+            if sin_buscador_seguidos >= MAX_SIN_BUSCADOR_SEGUIDOS:
+                motivo_corte = (
+                    f"BUSCADOR BLOQUEADO: {MAX_SIN_BUSCADOR_SEGUIDOS} leads seguidos sin ningún resultado. "
+                    "Se aborta la corrida para no perder horas; se reintenta en la próxima."
+                )
+                print(f"\n{motivo_corte}", flush=True)
+                break
             continue
         except CuotaGeminiAgotada as e:
-            print(f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}", flush=True)
+            motivo_corte = f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}"
+            print(motivo_corte, flush=True)
             break
         except ServicioGeminiTemporal as e:
-            no_auditados += 1
-            print(f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}", flush=True)
+            motivo_corte = f"GEMINI SIGUE NO DISPONIBLE DESPUÉS DE LOS REINTENTOS. Se detiene sin modificar este lead: {e}"
+            print(motivo_corte, flush=True)
             break
         except Exception as e:
             nota_error = f"Agente de Verificación: PENDIENTE. Error durante la auditoría; no se modificaron los datos: {e}"
@@ -1046,7 +1116,10 @@ def ejecutar_agente():
 
         # Sin email pero con WhatsApp de Córdoba ya cargado: pasa a Chequeado en amarillo.
         # El agente vuelve a buscar su email cada 7 días.
+        # OJO: ese número NO fue verificado en ninguna página; solo se mira su formato.
+        # Se controla con PASAR_SOLO_WHATSAPP_SIN_VERIFICAR (arriba).
         solo_whatsapp = bool(
+            PASAR_SOLO_WHATSAPP_SIN_VERIFICAR and
             not aprobado_final and
             alcance in ('CORDOBA_CAPITAL', 'UBICACION_INCIERTA') and
             re.match(r'^\+549351\d{7}$', telefono_actual or '')
@@ -1071,7 +1144,7 @@ def ejecutar_agente():
         if aprobado_final:
             partes_nota.append("APROBADO.")
         elif solo_whatsapp:
-            partes_nota.append(f"APROBADO SIN EMAIL. No se encontró un email público; pasa a Chequeado solo con el WhatsApp ya cargado ({telefono_actual}). Se volverá a buscar el email.")
+            partes_nota.append(f"APROBADO SIN EMAIL. No se encontró un email público; pasa a Chequeado solo con el WhatsApp ya cargado ({telefono_actual}), que NO pudo verificarse en una página. Se volverá a buscar el email.")
         else:
             partes_nota.append("PENDIENTE.")
         if email_confirmado:
@@ -1117,12 +1190,15 @@ def ejecutar_agente():
         else:
             pendientes += 1
 
+    minutos = int((time.time() - INICIO_EJECUCION) / 60)
     print(
-        f"\nRESUMEN: encontrados={len(leads)} | auditados={procesados} | aprobados_con_email={aprobados} | aprobados_solo_whatsapp={sin_email} "
-        f"| pendientes_auditados={pendientes} | fuera_alcance={fuera_alcance} "
-        f"| fallas_busqueda={fallas_busqueda} | no_auditados={len(leads)-procesados-fallas_busqueda}",
+        f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | aprobados_con_contacto_verificado={aprobados} "
+        f"| aprobados_solo_whatsapp_sin_verificar={sin_email} | pendientes_auditados={pendientes} | fuera_alcance={fuera_alcance} "
+        f"| sin_resultados_del_buscador={fallas_busqueda} | sin_tocar={len(leads) - procesados - fallas_busqueda}",
         flush=True
     )
+    if motivo_corte:
+        print(f"CORTE: {motivo_corte}", flush=True)
 
 
 if __name__ == "__main__":
