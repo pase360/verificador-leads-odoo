@@ -1,0 +1,21 @@
+name: Probar buscadores gratuitos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Descargar codigo del repositorio
+        uses: actions/checkout@v5
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+      - name: Probar buscadores
+        run: python probar_buscadores.py
