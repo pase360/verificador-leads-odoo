@@ -2,7 +2,7 @@ name: Agente Verificador de Leads Odoo
 
 on:
   schedule:
-    # 21:00 hora de Argentina.
+    # 4 corridas por dia (UTC 00, 06, 12, 18).
     - cron: '0 0,6,12,18 * * *'
   workflow_dispatch:
 
@@ -13,12 +13,14 @@ concurrency:
 jobs:
   verificar-leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # Tope duro. El script se corta solo a las 3h30m y termina en verde;
+    # este limite es solo una red de seguridad por si algo se cuelga.
+    timeout-minutes: 240
     steps:
       - name: Descargar codigo del repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Instalar dependencias
