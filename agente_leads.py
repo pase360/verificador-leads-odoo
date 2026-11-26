@@ -19,7 +19,8 @@ ODOO_USER = os.environ["ODOO_USER"]
 ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-ID_ETAPA_CHEQUEADO = 7  # Etapa destino
+ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar
+ID_ETAPA_CHEQUEADO = 7  # Chequeado: solo debe quedar lo VERDE (verificado)
 MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
@@ -27,13 +28,7 @@ MODELO_GEMINI = "gemini-3.5-flash-lite"
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
 TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-DIAS_REINTENTO_PENDIENTES = 0             # 0 = se revisan todos, los de auditoría más vieja primero (subir a 1 cuando la cola esté limpia)
-DIAS_REINTENTO_SIN_EMAIL = 0              # 0 = se revisan todos, los más viejos primero (subir a 7 cuando la cola esté limpia)
-
-# True  = conserva el comportamiento actual: un lead sin evidencia pero con WhatsApp +549351 ya cargado
-#         pasa a Chequeado en amarillo, SIN que ese número haya sido verificado en ninguna página.
-# False = esos leads quedan en Prospectos hasta que el número se confirme con evidencia.
-PASAR_SOLO_WHATSAPP_SIN_VERIFICAR = True
+HORAS_REINTENTO_PENDIENTES = 12           # Un lead que sigue en Prospectos no se vuelve a revisar antes de estas horas
 
 INICIO_EJECUCION = time.time()
 
@@ -552,6 +547,7 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
     telefonos = {}     # ultimos 8 dígitos -> datos
     candidatos = {}    # email -> url
     nombre_ok = False
+    tel_cargado = None  # URL donde el teléfono ya cargado en Odoo aparece junto al comercio
     orden = 0
 
     for bloque in separar_bloques(evidencia):
@@ -569,6 +565,8 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
         if exigir_cordoba and 'cordoba' not in bloque_n and not calle_confirmada(lead, bloque_n):
             continue
         nombre_ok = True
+        if telefono_lead and not tel_cargado and telefono_lead in re.sub(r'\D', '', bloque):
+            tel_cargado = url or 'resultado de búsqueda'
         elegible = tipo in prioridad   # solo web propia o nombre+calle confirman datos nuevos
         visible = bloque.split('Contenido visible:', 1)[-1].lower()
         host_bloque = urlparse(url).netloc.lower().replace('www.', '') if url else ''
@@ -643,6 +641,7 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
         'telefono': telefono_final,
         'tel_oficial': tel_oficial,
         'nombre_ok': nombre_ok,
+        'tel_cargado': tel_cargado,
         'candidatos': sin_confirmar,
     }
 
@@ -888,10 +887,9 @@ REGLAS:
 
 
 # Colores de la tarjeta en Odoo (sin color = todavía sin revisar)
-COLOR_PENDIENTE = 2       # naranja: revisado, falta confirmar
-COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital
-COLOR_APROBADO = 10       # verde: revisado y chequeado, con email
-COLOR_SOLO_WHATSAPP = 3   # amarillo: chequeado pero sin email (solo WhatsApp)
+COLOR_PENDIENTE = 2       # naranja: revisado, no se pudo verificar (queda en Prospectos)
+COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital (queda en Prospectos)
+COLOR_APROBADO = 10       # verde: verificado con evidencia (único color que se queda en Chequeado)
 
 
 def marcar_color(models, uid, lead_id, color):
@@ -909,16 +907,18 @@ def ejecutar_agente():
     print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
 
-    # SOLO se leen leads ya existentes en la etapa Prospectos por Controlar
-    # (COMERCIO y GENERADOR conviven en esa etapa). No se crean contactos, leads
-    # ni oportunidades nuevas, y las etiquetas nunca se modifican.
-    id_prospectos = 5
+    # Regla de las etapas:
+    #   - En Chequeado solo puede quedar lo VERDE (verificado con evidencia).
+    #   - Todo lo que no pueda verificarse (naranja, rojo, sin color, amarillo) vuelve a Prospectos.
+    #   - Los de Prospectos que se verifican pasan a Chequeado en verde.
+    # Las etiquetas nunca se modifican y no se crean leads nuevos.
+    id_prospectos = ID_ETAPA_PROSPECTOS
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color']
 
-    # Trae los leads de etapa 5 y los amarillos de Chequeado; luego se filtran por antigüedad de auditoría.
+    # Se revisan: todo Prospectos + todo lo de Chequeado que NO sea verde.
     dominio = [
         '|', ['stage_id', '=', id_prospectos],
-        '&', ['stage_id', '=', ID_ETAPA_CHEQUEADO], ['color', '=', COLOR_SOLO_WHATSAPP]
+        '&', ['stage_id', '=', ID_ETAPA_CHEQUEADO], ['color', '!=', COLOR_APROBADO]
     ]
     try:
         todos_los_leads = models.execute_kw(
@@ -927,7 +927,7 @@ def ejecutar_agente():
             {'fields': campos, 'limit': 10000, 'order': 'id asc'}
         )
     except Exception as exc:
-        # Si esta versión de Odoo no tiene el campo de color, se revisa solo la etapa 5.
+        # Si esta versión de Odoo no tiene el campo de color, no se puede distinguir lo verde: solo se revisa Prospectos.
         print(f"No se pudo usar el color en la consulta ({exc}); se revisa solo la etapa {id_prospectos}.", flush=True)
         todos_los_leads = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
@@ -935,9 +935,12 @@ def ejecutar_agente():
             {'fields': [c for c in campos if c != 'color'], 'limit': 10000, 'order': 'id asc'}
         )
 
+    # Las notas de "no devolvió evidencia suficiente" son fallas del buscador, no auditorías reales:
+    # no cuentan como revisión hecha.
     mensajes_agente = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
-        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:']]],
+        [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:'],
+          ['body', 'not ilike', 'no devolvió evidencia suficiente']]],
         {'fields': ['res_id', 'date'], 'limit': 20000, 'order': 'date desc'}
     )
     ultima_auditoria = {}
@@ -947,29 +950,28 @@ def ejecutar_agente():
         if res_id and (res_id not in ultima_auditoria or fecha > ultima_auditoria[res_id]):
             ultima_auditoria[res_id] = fecha
 
-    ahora = datetime.now(timezone.utc)
-    limite_pendientes = (ahora - timedelta(days=DIAS_REINTENTO_PENDIENTES)).strftime('%Y-%m-%d %H:%M:%S')
-    limite_amarillos = (ahora - timedelta(days=DIAS_REINTENTO_SIN_EMAIL)).strftime('%Y-%m-%d %H:%M:%S')
+    limite_pendientes = (datetime.now(timezone.utc) - timedelta(hours=HORAS_REINTENTO_PENDIENTES)).strftime('%Y-%m-%d %H:%M:%S')
 
     def _etapa_id(l):
         st = l.get('stage_id')
         return st[0] if isinstance(st, (list, tuple)) and st else st
 
-    total_etapa_5 = sum(1 for l in todos_los_leads if _etapa_id(l) == id_prospectos)
-    total_amarillos = len(todos_los_leads) - total_etapa_5
+    en_prospectos = sum(1 for l in todos_los_leads if _etapa_id(l) == id_prospectos)
+    en_chequeado_no_verde = len(todos_los_leads) - en_prospectos
 
-    # Un lead se revisa solo si nunca fue auditado o si pasó el tiempo de espera de su grupo.
-    # Esto evita volver a procesar en cada corrida los mismos leads que ya se revisaron hoy.
+    # Lo que está en Chequeado sin ser verde se revisa siempre (hay que sacarlo o ponerlo en verde).
+    # Lo que está en Prospectos se revisa si nunca se auditó o pasaron las horas de espera.
     def _toca_revisar(l):
-        ultima = ultima_auditoria.get(l['id'], '')
-        limite = limite_pendientes if _etapa_id(l) == id_prospectos else limite_amarillos
-        return ultima < limite
+        if _etapa_id(l) == ID_ETAPA_CHEQUEADO:
+            return True
+        return ultima_auditoria.get(l['id'], '') < limite_pendientes
 
     todos_los_leads = [l for l in todos_los_leads if _toca_revisar(l)]
 
-    # Sin auditoría previa primero; luego los auditados hace más tiempo.
+    # Primero lo de Chequeado no verde; luego los nunca auditados; luego los auditados hace más tiempo.
     todos_los_leads.sort(
         key=lambda lead: (
+            0 if _etapa_id(lead) == ID_ETAPA_CHEQUEADO else 1,
             ultima_auditoria.get(lead['id'], ''),
             lead['id']
         )
@@ -989,24 +991,22 @@ def ejecutar_agente():
     for lead in leads:
         lead['_etiquetas'] = ' / '.join(nombres_tags.get(t, '') for t in (lead.get('tag_ids') or []) if nombres_tags.get(t))
 
-    sin_auditoria_previa = sum(1 for lead in todos_los_leads if lead['id'] not in ultima_auditoria)
     print(
-        f"Etapa {id_prospectos}: {total_etapa_5} leads | Amarillos en Chequeado: {total_amarillos} | "
-        f"Les toca revisión: {len(todos_los_leads)} (nunca auditados: {sin_auditoria_previa}) | "
-        f"Lote de esta corrida: {len(leads)} | Tiempo máximo: {TIEMPO_MAXIMO_SEGUNDOS // 60} min | "
-        f"Modelo: {MODELO_GEMINI}.",
+        f"Prospectos: {en_prospectos} | Chequeado NO verde (a revisar y limpiar): {en_chequeado_no_verde} | "
+        f"Les toca revisión ahora: {len(todos_los_leads)} | Lote de esta corrida: {len(leads)} | "
+        f"Tiempo máximo: {TIEMPO_MAXIMO_SEGUNDOS // 60} min | Modelo: {MODELO_GEMINI}.",
         flush=True
     )
     if not leads:
         print("No hay leads pendientes para auditar.", flush=True)
         return
 
-    aprobados = 0
-    pendientes = 0
+    aprobados = 0          # quedaron o pasaron a Chequeado en verde
+    devueltos = 0          # estaban en Chequeado y volvieron a Prospectos
+    pendientes = 0         # siguen en Prospectos sin verificar
     procesados = 0
     fallas_busqueda = 0
     fuera_alcance = 0
-    sin_email = 0
     sin_buscador_seguidos = 0
     motivo_corte = ''
 
@@ -1016,11 +1016,18 @@ def ejecutar_agente():
             print(f"\n{motivo_corte}", flush=True)
             break
 
-        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
+        en_chequeado = (_etapa_id(lead) == ID_ETAPA_CHEQUEADO)
+        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] ({'en Chequeado' if en_chequeado else 'en Prospectos'}) (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         try:
             alcance = clasificar_alcance_geografico(lead)
 
             if alcance == 'FUERA_DE_ALCANCE':
+                if not en_chequeado and lead.get('color') == COLOR_FUERA_ALCANCE:
+                    # Ya estaba marcado en rojo en Prospectos: no se repite la nota.
+                    procesados += 1
+                    fuera_alcance += 1
+                    print("Fuera de alcance (ya marcado en rojo en Prospectos). Sin cambios.", flush=True)
+                    continue
                 provincia = lead.get('state_id')
                 pais = lead.get('country_id')
                 nota = (
@@ -1030,6 +1037,10 @@ def ejecutar_agente():
                     f"país: {pais[1] if isinstance(pais, (list, tuple)) and len(pais) > 1 else 'sin país'}). "
                     "No se realizó búsqueda ni se modificaron datos."
                 )
+                if en_chequeado:
+                    nota += " Se devuelve de Chequeado a Prospectos."
+                    devueltos += 1
+                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], {'stage_id': id_prospectos}])
                 registrar_nota(models, uid, lead['id'], nota)
                 marcar_color(models, uid, lead['id'], COLOR_FUERA_ALCANCE)
                 procesados += 1
@@ -1041,19 +1052,18 @@ def ejecutar_agente():
             # cada fuente debe nombrar Córdoba para poder aprobar (ver evaluar_evidencia).
             info_ddgs = investigacion_profunda_con_google_search(lead)
             sin_buscador_seguidos = 0  # el buscador respondió: se reinicia el contador de bloqueo
-            # Gemini solo se consulta si la búsqueda halló algún mail o teléfono que confirmar:
-            # si no hay nada, no puede aportar y se ahorra cuota diaria.
+            # Gemini solo se consulta si la búsqueda halló algo que confirmar (email, teléfono nuevo
+            # o el teléfono ya cargado visto junto al comercio): si no hay nada, no puede aportar.
             vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
             previa = evaluar_evidencia(lead, info_ddgs, vacio, alcance)
-            if previa['email'] or previa['telefono']:
+            if previa['email'] or previa['telefono'] or previa['tel_cargado']:
                 resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
             else:
                 resultado = vacio
 
         except BusquedaSinEvidencia as e:
             # El buscador no devolvió NADA para este lead: casi seguro está bloqueado.
-            # No se escribe nota ni color (así el lead no se marca como auditado y no se
-            # acumulan notas repetidas); simplemente se salta y se cuenta.
+            # No se modifica el lead (ni nota ni color ni etapa); se salta y se cuenta.
             fallas_busqueda += 1
             sin_buscador_seguidos += 1
             print(f"BUSQUEDA SIN RESULTADOS ({sin_buscador_seguidos}/{MAX_SIN_BUSCADOR_SEGUIDOS}). El lead no se modifica: {e}", flush=True)
@@ -1076,7 +1086,7 @@ def ejecutar_agente():
         except Exception as e:
             nota_error = f"Agente de Verificación: PENDIENTE. Error durante la auditoría; no se modificaron los datos: {e}"
             registrar_nota(models, uid, lead['id'], nota_error)
-            print(f"Error en lead {lead['id']}; queda pendiente y se continúa: {e}", flush=True)
+            print(f"Error en lead {lead['id']}; queda como estaba y se continúa: {e}", flush=True)
             pendientes += 1
             continue
 
@@ -1105,6 +1115,11 @@ def ejecutar_agente():
                 telefono_confirmado = telefono_hallado
             else:
                 sin_aplicar.append(f"teléfono {telefono_hallado[0]} (visto en {telefono_hallado[1] or 'búsqueda'})")
+        # El teléfono que ya estaba cargado en Odoo también queda verificado si aparece escrito
+        # junto al nombre del comercio en una página o resultado de búsqueda.
+        if not telefono_confirmado and evidencia['tel_cargado'] and telefono_actual and es_telefono_cordoba(telefono_actual):
+            telefono_confirmado = (telefono_actual, evidencia['tel_cargado'])
+            mismo_numero = True
         contacto_verificado = bool(email_confirmado or telefono_confirmado)
 
         aprobado_final = bool(
@@ -1112,17 +1127,6 @@ def ejecutar_agente():
             resultado.coincide_ubicacion_y_rubro and
             evidencia['nombre_ok'] and
             contacto_verificado
-        )
-
-        # Sin email pero con WhatsApp de Córdoba ya cargado: pasa a Chequeado en amarillo.
-        # El agente vuelve a buscar su email cada 7 días.
-        # OJO: ese número NO fue verificado en ninguna página; solo se mira su formato.
-        # Se controla con PASAR_SOLO_WHATSAPP_SIN_VERIFICAR (arriba).
-        solo_whatsapp = bool(
-            PASAR_SOLO_WHATSAPP_SIN_VERIFICAR and
-            not aprobado_final and
-            alcance in ('CORDOBA_CAPITAL', 'UBICACION_INCIERTA') and
-            re.match(r'^\+549351\d{7}$', telefono_actual or '')
         )
 
         partes_nota = []
@@ -1137,16 +1141,13 @@ def ejecutar_agente():
             valores_actualizar['phone'] = telefono_confirmado[0]
             if telefono_actual:
                 extra_nota.append(f"El teléfono anterior era {telefono_actual}.")
-        # Solo se actualizan datos de contacto y la etapa; nunca la web ni las etiquetas.
-        if aprobado_final or solo_whatsapp:
-            valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO
+        # Solo verde en Chequeado: verificado -> Chequeado; no verificado -> Prospectos.
+        valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO if aprobado_final else id_prospectos
 
         if aprobado_final:
-            partes_nota.append("APROBADO.")
-        elif solo_whatsapp:
-            partes_nota.append(f"APROBADO SIN EMAIL. No se encontró un email público; pasa a Chequeado solo con el WhatsApp ya cargado ({telefono_actual}), que NO pudo verificarse en una página. Se volverá a buscar el email.")
+            partes_nota.append("APROBADO (verde): contacto verificado con evidencia." + (" Queda en Chequeado." if en_chequeado else " Pasa a Chequeado."))
         else:
-            partes_nota.append("PENDIENTE.")
+            partes_nota.append("PENDIENTE." + (" Se devuelve de Chequeado a Prospectos porque no se pudo verificar." if en_chequeado else " Queda en Prospectos."))
         if email_confirmado:
             partes_nota.append(f"Email confirmado: {email_confirmado[0]} (fuente: {email_confirmado[1] or 'resultado de búsqueda'}).")
             if evidencia['otros_emails']:
@@ -1156,7 +1157,7 @@ def ejecutar_agente():
         partes_nota.extend(extra_nota)
         if sin_aplicar:
             partes_nota.append("NO se cambió porque no salió de la web propia del comercio y Odoo ya tenía otro dato: " + "; ".join(sin_aplicar) + ".")
-        if not aprobado_final and not solo_whatsapp:
+        if not aprobado_final:
             faltantes = []
             if not contacto_verificado:
                 faltantes.append("no se confirmó email ni teléfono en una página que pertenezca claramente al comercio")
@@ -1176,24 +1177,23 @@ def ejecutar_agente():
             flush=True
         )
 
-        if valores_actualizar:
-            models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
 
         registrar_nota(models, uid, lead['id'], "Agente de Verificación: " + " ".join(partes_nota))
-        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else (COLOR_SOLO_WHATSAPP if solo_whatsapp else COLOR_PENDIENTE))
+        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else COLOR_PENDIENTE)
 
         procesados += 1
         if aprobado_final:
             aprobados += 1
-        elif solo_whatsapp:
-            sin_email += 1
+        elif en_chequeado:
+            devueltos += 1
         else:
             pendientes += 1
 
     minutos = int((time.time() - INICIO_EJECUCION) / 60)
     print(
-        f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | aprobados_con_contacto_verificado={aprobados} "
-        f"| aprobados_solo_whatsapp_sin_verificar={sin_email} | pendientes_auditados={pendientes} | fuera_alcance={fuera_alcance} "
+        f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | verdes_en_Chequeado={aprobados} "
+        f"| devueltos_a_Prospectos={devueltos} | siguen_en_Prospectos={pendientes} | fuera_alcance={fuera_alcance} "
         f"| sin_resultados_del_buscador={fallas_busqueda} | sin_tocar={len(leads) - procesados - fallas_busqueda}",
         flush=True
     )
