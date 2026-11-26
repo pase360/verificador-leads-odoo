@@ -27,8 +27,8 @@ MODELO_GEMINI = "gemini-3.5-flash-lite"
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
 TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-DIAS_REINTENTO_PENDIENTES = 1             # Un lead pendiente en etapa 5 no se vuelve a revisar antes de este tiempo
-DIAS_REINTENTO_SIN_EMAIL = 7              # Los amarillos (Chequeado sin email) se vuelven a revisar cada 7 días
+DIAS_REINTENTO_PENDIENTES = 0             # 0 = se revisan todos, los de auditoría más vieja primero (subir a 1 cuando la cola esté limpia)
+DIAS_REINTENTO_SIN_EMAIL = 0              # 0 = se revisan todos, los más viejos primero (subir a 7 cuando la cola esté limpia)
 
 # True  = conserva el comportamiento actual: un lead sin evidencia pero con WhatsApp +549351 ya cargado
 #         pasa a Chequeado en amarillo, SIN que ese número haya sido verificado en ninguna página.
