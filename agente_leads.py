@@ -30,6 +30,11 @@ TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
 HORAS_REINTENTO_PENDIENTES = 12           # Un lead que sigue en Prospectos no se vuelve a revisar antes de estas horas
 
+# True = un email/teléfono solo se confirma si sale de la web propia del comercio (o su perfil de Facebook/Instagram)
+#        o si aparece en al menos 2 sitios distintos que nombran al comercio. Lo visto en un solo directorio NO alcanza.
+# False = cualquier fuente que nombre al comercio alcanza (más leads verdes, menos seguridad).
+EXIGIR_FUENTE_PROPIA_O_DOBLE = True
+
 INICIO_EJECUCION = time.time()
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
@@ -52,6 +57,21 @@ EMAILS_BASURA = (
     'wordpress.com', 'domain.com', 'tuemail', 'tucorreo', 'tumail',
     'usuario@', 'nombre@', 'ejemplo', 'email@email'
 )
+# Webs y correos de otros países (ej. una librería de España con el mismo nombre) nunca son del comercio.
+TLD_EXTRANJEROS = ('.es', '.mx', '.cl', '.uy', '.py', '.pe', '.co', '.br', '.it', '.au', '.fr', '.de',
+                   '.uk', '.pt', '.ec', '.bo', '.ve', '.cr', '.pa', '.cu', '.do', '.gt', '.hn', '.ni', '.sv')
+
+
+def dominio_extranjero(host):
+    host = (host or '').lower().strip('/')
+    return any(host.endswith(t) for t in TLD_EXTRANJEROS)
+
+
+def con_prefijo_mas(telefono):
+    solo = re.sub(r'\D', '', telefono or '')
+    return ('+' + solo) if solo.startswith('54') else telefono
+
+
 PALABRAS_CALLE_IGNORADAS = {'av', 'avenida', 'bv', 'boulevard', 'calle', 'pasaje', 'pje', 'ruta', 'diagonal'}
 PALABRAS_NOMBRE_GENERICAS = {'cordoba', 'argentina', 'sucursal', 'centro', 'nueva', 'nuevo', 'general'}
 PALABRAS_VACIAS_NOMBRE = {'en', 'de', 'del', 'la', 'el', 'los', 'las', 'y', 'e', 'un', 'una', 'con', 'para'}
@@ -292,6 +312,10 @@ def clasificar_alcance_geografico(lead):
         # el segundo carácter debe ser 5. X5 incluye muchas localidades, no solo Capital.
         if not codigo_postal.startswith('X5'):
             return 'FUERA_DE_ALCANCE'
+        numero_cp = int(codigo_postal[1:5])
+        if not (5000 <= numero_cp <= 5023 or numero_cp in (5147, 5149)):
+            print(f"Ubicación pendiente: el CP {codigo_postal} no corresponde a Córdoba Capital; se exige evidencia explícita.", flush=True)
+            return 'UBICACION_INCIERTA'
 
     alcance, detalle = consultar_georef_direccion(lead, codigo_postal)
     print(
@@ -390,6 +414,8 @@ def email_util(email):
     dominio = e.split('@')[-1]
     if any(d in dominio for d in DOMINIOS_DIRECTORIO):
         return ''
+    if dominio_extranjero(dominio):
+        return ''
     return e
 
 
@@ -430,13 +456,27 @@ def calle_confirmada(lead, bloque_n):
     return altura in palabras and all(t in palabras for t in calle)
 
 
+RUBROS_NORMALIZADOS = {
+    'dietetica', 'verduleria', 'ferreteria', 'floreria', 'farmacia', 'cotillon', 'panaderia', 'carniceria',
+    'heladeria', 'pintureria', 'peluqueria', 'kiosco', 'autolavadero', 'tienda', 'almacen', 'lavadero',
+    'jugueteria', 'optica', 'libreria', 'bazar', 'rotiseria', 'pasteleria', 'distribuidora', 'mayorista'
+}
+
+
 def texto_coincide_con_nombre(lead, texto_compacto):
     _, corto = nombres_del_lead(lead)
     junto = corto.replace(' ', '')
     if len(junto) >= 5 and junto in texto_compacto:
         return True
     tokens = [t for t in corto.split() if len(t) >= 3 and t not in PALABRAS_NOMBRE_GENERICAS]
-    return len(tokens) >= 2 and all(t in texto_compacto for t in tokens)
+    if len(tokens) >= 2 and all(t in texto_compacto for t in tokens):
+        return True
+    # Perfiles y webs suelen omitir el rubro ("trigatti" en vez de "panaderia trigatti"): se compara con
+    # las palabras distintivas del nombre (sin rubro ni palabras vacías), que sumen al menos 5 letras.
+    distintivos = [t for t in corto.split()
+                   if len(t) >= 3 and t not in PALABRAS_NOMBRE_GENERICAS
+                   and t not in RUBROS_NORMALIZADOS and t not in PALABRAS_VACIAS_NOMBRE]
+    return bool(distintivos) and sum(len(t) for t in distintivos) >= 5 and all(t in texto_compacto for t in distintivos)
 
 
 def url_coincide_con_nombre(lead, url):
@@ -475,7 +515,7 @@ def tipo_de_fuente(lead, bloque, bloque_n, telefono_lead):
     tiene_calle = calle_confirmada(lead, bloque_n)
     digitos = re.sub(r'\D', '', bloque)
     tiene_telefono = bool(telefono_lead and telefono_lead in digitos)
-    if not es_red and url_coincide_con_nombre(lead, url) and (tiene_calle or tiene_telefono or 'cordoba' in bloque_n):
+    if not es_red and not dominio_extranjero(host) and url_coincide_con_nombre(lead, url) and (tiene_calle or tiene_telefono or 'cordoba' in bloque_n):
         return 'oficial'
     if not nombre_en_bloque(lead, bloque_n):
         return ''
@@ -522,6 +562,18 @@ def telefonos_en_texto(bloque):
     return encontrados
 
 
+def es_fuente_propia(lead, url, dominios_propios):
+    """True si la URL es la web propia del comercio (ya verificada) o su perfil de Facebook/Instagram."""
+    if not url:
+        return False
+    host = urlparse(url).netloc.lower().replace('www.', '')
+    if host in dominios_propios:
+        return True
+    if any(d in host for d in DOMINIOS_SOCIALES):
+        return url_coincide_con_nombre(lead, url)
+    return False
+
+
 def evaluar_evidencia(lead, evidencia, resultado, alcance):
     """
     Revisa toda la evidencia y devuelve:
@@ -529,8 +581,15 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
       email_oficial / tel_oficial: True si salió de la web propia del comercio
       otros_emails: otros mails publicados por el comercio
       nombre_ok: bool
-      candidatos: mails vistos junto al nombre pero sin confirmar (solo para la nota)
-    Regla clave: si la web propia del comercio publica un dato, manda sobre redes y directorios.
+      tel_cargado: URL que respalda el teléfono ya cargado en Odoo (o None)
+      candidatos / tel_debiles: datos vistos pero SIN respaldo suficiente (solo para la nota)
+
+    Un dato solo se confirma si (EXIGIR_FUENTE_PROPIA_O_DOBLE):
+      - aparece en la web propia del comercio (cualquiera de sus páginas) o en su perfil de Facebook/Instagram, o
+      - aparece en al menos 2 sitios distintos, cada uno nombrando al comercio.
+    La web propia se identifica a nivel de SITIO: si el dominio coincide con el nombre y alguna página del
+    sitio confirma calle, teléfono cargado o Córdoba, TODAS las páginas de ese dominio (contacto, nosotros, etc.)
+    sirven, aunque el dato esté repartido en varias páginas.
     """
     prioridad = {'oficial': 0, 'calle': 1}
     # Se usan los últimos 7 dígitos (sin código de área): así coincide aunque la página
@@ -542,19 +601,43 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
     digitos_ia = re.sub(r'\D', '', telefono_ia)[-8:] if telefono_ia else ''
     email_ia = email_util(resultado.email_elegido)
     exigir_cordoba = (alcance == 'UBICACION_INCIERTA')
+    bloques = separar_bloques(evidencia)
+
+    # Paso 1: sitios propios (a nivel de dominio completo).
+    dominios_propios = set()
+    for bloque in bloques:
+        url = url_del_bloque(bloque)
+        if not url:
+            continue
+        host = urlparse(url).netloc.lower().replace('www.', '')
+        if any(d in host for d in DOMINIOS_SOCIALES) or dominio_extranjero(host):
+            continue
+        if not url_coincide_con_nombre(lead, url):
+            continue
+        bloque_n = normalizar_texto(bloque)
+        digitos = re.sub(r'\D', '', bloque)
+        if calle_confirmada(lead, bloque_n) or (telefono_lead and telefono_lead in digitos) or 'cordoba' in bloque_n:
+            dominios_propios.add(host)
 
     confirmados = {}   # email -> (tipo, rango, pos, orden, url)
+    email_hosts = {}   # email -> sitios donde aparece
+    email_propia = set()
     telefonos = {}     # ultimos 8 dígitos -> datos
-    candidatos = {}    # email -> url
+    candidatos = {}    # email -> url (sin respaldo suficiente)
     nombre_ok = False
-    tel_cargado = None  # URL donde el teléfono ya cargado en Odoo aparece junto al comercio
+    tel_hosts = set()  # sitios donde el teléfono ya cargado aparece junto al comercio
+    tel_propia = False
+    tel_url = None
     orden = 0
 
-    for bloque in separar_bloques(evidencia):
+    for bloque in bloques:
         bloque_n = normalizar_texto(bloque)
         url = url_del_bloque(bloque)
+        host_bloque = urlparse(url).netloc.lower().replace('www.', '') if url else ''
         con_nombre = nombre_en_bloque(lead, bloque_n)
         tipo = tipo_de_fuente(lead, bloque, bloque_n, telefono_lead)
+        if not tipo and host_bloque in dominios_propios:
+            tipo = 'oficial'   # otra página del mismo sitio ya verificado
         emails_bloque = emails_en_texto(bloque)
 
         if not tipo:
@@ -562,22 +645,28 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
                 for e in emails_bloque:
                     candidatos.setdefault(e, url)
             continue
-        if exigir_cordoba and 'cordoba' not in bloque_n and not calle_confirmada(lead, bloque_n):
+        if exigir_cordoba and host_bloque not in dominios_propios and 'cordoba' not in bloque_n and not calle_confirmada(lead, bloque_n):
             continue
         nombre_ok = True
-        if telefono_lead and not tel_cargado and telefono_lead in re.sub(r'\D', '', bloque):
-            tel_cargado = url or 'resultado de búsqueda'
+        propia_bloque = es_fuente_propia(lead, url, dominios_propios)
+        if telefono_lead and telefono_lead in re.sub(r'\D', '', bloque):
+            tel_hosts.add(host_bloque or url)
+            tel_url = tel_url or url or 'resultado de búsqueda'
+            if propia_bloque:
+                tel_propia = True
         elegible = tipo in prioridad   # solo web propia o nombre+calle confirman datos nuevos
         visible = bloque.split('Contenido visible:', 1)[-1].lower()
-        host_bloque = urlparse(url).netloc.lower().replace('www.', '') if url else ''
 
         for e in emails_bloque:
+            email_hosts.setdefault(e, set()).add(host_bloque or url)
+            if propia_bloque:
+                email_propia.add(e)
             if e in confirmados:
                 continue
             dominio = e.split('@')[-1]
             if dominio in DOMINIOS_CORREO_GENERICOS:
                 # Gmail/Hotmail: puede ser de cualquiera, el nombre debe estar en la misma fuente.
-                aceptado = con_nombre
+                aceptado = con_nombre or host_bloque in dominios_propios
                 rango = 10
             else:
                 aceptado = (
@@ -599,16 +688,29 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
                 existente = telefonos.get(clave)
                 if existente is None:
                     orden += 1
-                    telefonos[clave] = {'tel': tel, 'tipo': tipo, 'pos': pos, 'orden': orden, 'url': url}
+                    existente = telefonos[clave] = {'tel': tel, 'tipo': tipo, 'pos': pos, 'orden': orden,
+                                                    'url': url, 'hosts': set(), 'propia': False}
                 elif tel.startswith('+549') and not existente['tel'].startswith('+549'):
                     existente['tel'] = tel
+                existente['hosts'].add(host_bloque or url)
+                if propia_bloque:
+                    existente['propia'] = True
 
-    # Email: si la web propia publica alguno, solo valen los de la web propia.
+    def _firme(propia, hosts):
+        return (not EXIGIR_FUENTE_PROPIA_O_DOBLE) or propia or len(hosts) >= 2
+
+    # Email: solo los con respaldo suficiente. Si la web propia publica alguno, solo valen los de la web propia.
     email_final = None
     email_oficial = False
     otros_confirmados = []
-    if confirmados:
-        pool = list(confirmados.items())
+    firmes = {}
+    for e, v in confirmados.items():
+        if _firme(e in email_propia, email_hosts.get(e, set())):
+            firmes[e] = v
+        else:
+            candidatos.setdefault(e, v[4])
+    if firmes:
+        pool = list(firmes.items())
         if any(v[0] == 'oficial' for _, v in pool):
             pool = [(e, v) for e, v in pool if v[0] == 'oficial']
             email_oficial = True
@@ -622,8 +724,12 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
     # Teléfono: misma regla; entre varios, el que aparece primero en la página.
     telefono_final = None
     tel_oficial = False
-    if telefonos:
-        pool = list(telefonos.values())
+    tel_debiles = []
+    todos_tel = list(telefonos.values())
+    firmes_tel = [t for t in todos_tel if _firme(t['propia'], t['hosts'])]
+    tel_debiles = [(t['tel'], t['url']) for t in todos_tel if t not in firmes_tel][:3]
+    if firmes_tel:
+        pool = firmes_tel
         if any(t['tipo'] == 'oficial' for t in pool):
             pool = [t for t in pool if t['tipo'] == 'oficial']
             tel_oficial = True
@@ -633,7 +739,11 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
         ))
         telefono_final = (pool[0]['tel'], pool[0]['url'])
 
-    sin_confirmar = [(e, u) for e, u in candidatos.items() if e not in confirmados][:3]
+    # Teléfono ya cargado en Odoo: queda verificado solo con respaldo suficiente.
+    tel_cargado = tel_url if (tel_url and _firme(tel_propia, tel_hosts)) else None
+    tel_cargado_debil = tel_url if (tel_url and not tel_cargado) else None
+
+    sin_confirmar = [(e, u) for e, u in candidatos.items() if e not in firmes][:3]
     return {
         'email': email_final,
         'email_oficial': email_oficial,
@@ -642,6 +752,8 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
         'tel_oficial': tel_oficial,
         'nombre_ok': nombre_ok,
         'tel_cargado': tel_cargado,
+        'tel_cargado_debil': tel_cargado_debil,
+        'tel_debiles': tel_debiles,
         'candidatos': sin_confirmar,
     }
 
@@ -1138,7 +1250,7 @@ def ejecutar_agente():
             if email_actual:
                 extra_nota.append(f"El email anterior era {email_actual}.")
         if telefono_confirmado and not mismo_numero:
-            valores_actualizar['phone'] = telefono_confirmado[0]
+            valores_actualizar['phone'] = con_prefijo_mas(telefono_confirmado[0])
             if telefono_actual:
                 extra_nota.append(f"El teléfono anterior era {telefono_actual}.")
         # Solo verde en Chequeado: verificado -> Chequeado; no verificado -> Prospectos.
@@ -1168,7 +1280,12 @@ def ejecutar_agente():
             partes_nota.append("No pasa a Chequeado: " + ", ".join(faltantes or ["validación insuficiente"]) + ".")
             if evidencia['candidatos']:
                 lista = "; ".join(f"{e} (visto en {u or 'resultado de búsqueda'})" for e, u in evidencia['candidatos'])
-                partes_nota.append(f"Emails vistos sin confirmar, para revisar a mano: {lista}.")
+                partes_nota.append(f"Emails vistos sin respaldo suficiente (una sola fuente no propia): {lista}.")
+            if evidencia['tel_debiles'] or evidencia['tel_cargado_debil']:
+                vistos = [f"{t} (visto en {u or 'resultado de búsqueda'})" for t, u in evidencia['tel_debiles']]
+                if evidencia['tel_cargado_debil']:
+                    vistos.append(f"el teléfono ya cargado (visto solo en {evidencia['tel_cargado_debil']})")
+                partes_nota.append("Teléfonos vistos sin respaldo suficiente: " + "; ".join(vistos) + ".")
         if alcance == 'UBICACION_INCIERTA':
             partes_nota.append("Georef no confirmó la dirección exacta; se exigió que cada fuente nombrara Córdoba o la calle y número.")
 
