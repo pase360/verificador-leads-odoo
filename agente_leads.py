@@ -25,7 +25,7 @@ ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
 ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
 ID_ETAPA_REVISAR = 11    # Revisar: revisión manual
 MAX_LEADS_POR_EJECUCION = None  # None = todos los que haya en Prospectos; el límite real es el tiempo máximo de abajo.
-SOLO_IDS = [1512, 1130, 1518, 665]  # Para probar: IDs de leads que estén en Prospectos, ej. [1512, 1130, 1518, 665]. Vacío = todos.
+SOLO_IDS = []  # Para probar: IDs de leads que estén en Prospectos, ej. [1512, 1130, 1518, 665]. Vacío = todos.
 INTERVALO_GEMINI_SEGUNDOS = 4.2  # Separación mínima entre llamadas a Gemini (ya no se suma al resto del trabajo)
 MODELO_GEMINI = "gemini-3.5-flash-lite"
 
@@ -806,7 +806,9 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
             pool = [t for t in pool if t['tipo'] == 'oficial']
             tel_oficial = True
         pool.sort(key=lambda t: (
-            prioridad[t['tipo']], t['pos'],
+            prioridad[t['tipo']],
+            0 if (telefono_lead and re.sub(r'\D', '', t['tel'])[-7:] == telefono_lead) else 1,
+            t['pos'],
             0 if re.sub(r'\D', '', t['tel'])[-8:] == digitos_ia else 1, t['orden']
         ))
         telefono_final = (pool[0]['tel'], pool[0]['url'])
@@ -1204,6 +1206,31 @@ def registrar_nota(models, uid, lead_id, nota):
     models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'message_post', [[lead_id]], {'body': nota})
 
 
+def decidir_telefono(telefono_actual, evidencia):
+    """
+    Decide qué celular queda confirmado. Devuelve (telefono_confirmado, mismo_numero, sin_aplicar, otros_celulares).
+      1) Si el celular que Odoo ya tiene aparece respaldado en una fuente firme (web propia o 2 sitios), SE CONSERVA,
+         aunque la web publique otros celulares (esos se informan en la nota, pero no pisan el dato).
+      2) Si no, un celular hallado reemplaza al de Odoo solo si Odoo no tiene celular, es el mismo número
+         o sale de la web propia del comercio.
+    """
+    telefono_hallado = evidencia['telefono']
+    ultimos8 = lambda t: re.sub(r'\D', '', t or '')[-8:]
+    sin_aplicar, otros = [], []
+    if telefono_actual and es_telefono_cordoba(telefono_actual) and evidencia['tel_cargado']:
+        if telefono_hallado and ultimos8(telefono_hallado[0]) != ultimos8(telefono_actual):
+            otros.append(telefono_hallado[0])
+        return (telefono_actual, evidencia['tel_cargado']), True, sin_aplicar, otros
+    if telefono_hallado:
+        mismo_numero = ultimos8(telefono_hallado[0]) == ultimos8(telefono_actual)
+        # Si Odoo tiene un FIJO cargado, un celular verificado lo reemplaza (el fijo no sirve para WhatsApp).
+        odoo_tiene_celular = bool(telefono_actual) and es_celular_argentino(telefono_actual)
+        if mismo_numero or not odoo_tiene_celular or evidencia['tel_oficial']:
+            return telefono_hallado, mismo_numero, sin_aplicar, otros
+        sin_aplicar.append(f"celular {telefono_hallado[0]} (visto en {telefono_hallado[1] or 'búsqueda'})")
+    return None, False, sin_aplicar, otros
+
+
 def ejecutar_agente():
     if not ID_ETAPA_REVISAR:
         raise SystemExit("Falta configurar ID_ETAPA_REVISAR (el número de la etapa 'Revisar' en Odoo). No se hizo ningún cambio.")
@@ -1377,20 +1404,8 @@ def ejecutar_agente():
                 email_confirmado = email_hallado
             else:
                 sin_aplicar.append(f"email {email_hallado[0]} (visto en {email_hallado[1] or 'búsqueda'})")
-        mismo_numero = False
-        if telefono_hallado:
-            mismo_numero = re.sub(r'\D', '', telefono_hallado[0])[-8:] == re.sub(r'\D', '', telefono_actual or '')[-8:]
-            # Si Odoo tiene un FIJO cargado, un celular verificado lo reemplaza (el fijo no sirve para WhatsApp).
-            odoo_tiene_celular = bool(telefono_actual) and es_celular_argentino(telefono_actual)
-            if mismo_numero or not odoo_tiene_celular or evidencia['tel_oficial']:
-                telefono_confirmado = telefono_hallado
-            else:
-                sin_aplicar.append(f"celular {telefono_hallado[0]} (visto en {telefono_hallado[1] or 'búsqueda'})")
-        # El celular que ya estaba cargado en Odoo también queda verificado si aparece escrito
-        # junto al nombre del comercio en una página o resultado de búsqueda.
-        if not telefono_confirmado and evidencia['tel_cargado'] and telefono_actual and es_telefono_cordoba(telefono_actual):
-            telefono_confirmado = (telefono_actual, evidencia['tel_cargado'])
-            mismo_numero = True
+        telefono_confirmado, mismo_numero, sin_aplicar_tel, otros_celulares = decidir_telefono(telefono_actual, evidencia)
+        sin_aplicar.extend(sin_aplicar_tel)
         contacto_verificado = bool(email_confirmado or telefono_confirmado)
 
         aprobado_final = bool(
@@ -1425,6 +1440,8 @@ def ejecutar_agente():
                 partes_nota.append("Otros emails también publicados por el comercio: " + ", ".join(evidencia['otros_emails']) + ".")
         if telefono_confirmado:
             partes_nota.append(f"Celular confirmado: {telefono_confirmado[0]} (fuente: {telefono_confirmado[1] or 'resultado de búsqueda'}).")
+            if otros_celulares:
+                partes_nota.append("Otros celulares publicados por el comercio (no se cambió el dato de Odoo): " + ", ".join(otros_celulares) + ".")
         partes_nota.extend(extra_nota)
         if sin_aplicar:
             partes_nota.append("NO se cambió porque no salió de la web propia del comercio y Odoo ya tenía otro dato: " + "; ".join(sin_aplicar) + ".")
