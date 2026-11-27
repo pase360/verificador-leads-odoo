@@ -29,7 +29,7 @@ MODELO_GEMINI = "gemini-3.5-flash-lite"
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
 TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-HORAS_REINTENTO_PENDIENTES = 12           # Un lead que sigue en Prospectos (por error) no se vuelve a revisar antes de estas horas
+HORAS_REINTENTO_PENDIENTES = 0           # Un lead que sigue en Prospectos (por error) no se vuelve a revisar antes de estas horas
 
 # True = un email/teléfono solo se confirma si sale de la web propia del comercio (o su perfil de Facebook/Instagram)
 #        o si aparece en al menos 2 sitios distintos que nombran al comercio. Lo visto en un solo directorio NO alcanza.
