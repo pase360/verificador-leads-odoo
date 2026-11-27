@@ -5,6 +5,7 @@ import unicodedata
 from types import SimpleNamespace
 import xmlrpc.client
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
 from ddgs import DDGS
@@ -23,14 +24,22 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
 ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
 ID_ETAPA_REVISAR = 11    # Revisar: revisión manual
-MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
-INTERVALO_GEMINI_SEGUNDOS = 4.2
+MAX_LEADS_POR_EJECUCION = 10  # None = todos los que haya en Prospectos; el límite real es el tiempo máximo de abajo.
+INTERVALO_GEMINI_SEGUNDOS = 4.2  # Separación mínima entre llamadas a Gemini (ya no se suma al resto del trabajo)
 MODELO_GEMINI = "gemini-3.5-flash-lite"
 
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
-TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
-MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-HORAS_REINTENTO_PENDIENTES = 0            # Un lead que sigue en Prospectos (por error) se vuelve a revisar en la próxima corrida
+TIEMPO_MAXIMO_SEGUNDOS = int(5.25 * 3600)  # Corta limpio a las 5 h 15 min; lo que falte se toma en la próxima corrida
+MAX_SIN_BUSCADOR_SEGUIDOS = 5              # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
+HORAS_REINTENTO_PENDIENTES = 0             # Un lead que sigue en Prospectos (por error) se vuelve a revisar en la próxima corrida
+
+# --- Velocidad ---
+MAX_HILOS_PAGINAS = 8              # Páginas web que se descargan al mismo tiempo
+MAX_PAGINAS_PRIMERA_TANDA = 14     # Páginas de la primera descarga paralela
+MAX_PAGINAS_SEGUNDA_TANDA = 6      # Páginas internas de contacto descubiertas en la primera tanda
+PAUSA_ENTRE_BUSQUEDAS = 0.7        # Antes 2 s
+PAUSA_ENTRE_BACKENDS = 0.5         # Antes 1.5 s
+ESPERA_REINTENTO_BUSCADOR = 20     # Antes 30 s
 
 # True = un email/teléfono solo se confirma si sale de la web propia del comercio (o su perfil de Facebook/Instagram)
 #        o si aparece en al menos 2 sitios distintos que nombran al comercio. Lo visto en un solo directorio NO alcanza.
@@ -105,10 +114,18 @@ class ServicioGeminiTemporal(Exception):
     pass
 
 
+_ULTIMA_LLAMADA_GEMINI = 0.0
+
+
 def generar_con_gemini(**kwargs):
+    """Llama a Gemini respetando una separación mínima entre llamadas (no una pausa fija por llamada)."""
+    global _ULTIMA_LLAMADA_GEMINI
     ultimo_error = None
     for intento in range(3):
-        time.sleep(INTERVALO_GEMINI_SEGUNDOS)
+        faltante = INTERVALO_GEMINI_SEGUNDOS - (time.time() - _ULTIMA_LLAMADA_GEMINI)
+        if faltante > 0:
+            time.sleep(faltante)
+        _ULTIMA_LLAMADA_GEMINI = time.time()
         try:
             return client_ai.models.generate_content(**kwargs)
         except Exception as exc:
@@ -535,15 +552,33 @@ def tipo_de_fuente(lead, bloque, bloque_n, telefono_lead):
 PATRON_TELEFONO = re.compile(
     r'(?<!\d)(?:\+?54[\s().-]*9?[\s().-]*)?(?:0[\s().-]*)?\d{2,4}[\s().-]*(?:15[\s().-]*)?\d{2,4}[\s().-]*\d{4}(?!\d)'
 )
+
+
+def es_celular_argentino(formateado):
+    """Detecta móvil argentino inequívoco (prefijo 549 o formato nacional con 15).
+    No confunde fijos de Córdoba (351) con móviles. No confirma cuenta WhatsApp activa.
+    """
+    d = re.sub(r'\D', '', str(formateado or ''))
+    if d.startswith('549') and len(d) == 13:
+        return True
+    if d.startswith('0') and len(d) == 13 and d[4:6] == '15':
+        return True
+    if len(d) == 11 and d[3:5] == '15':
+        return True
+    return False
+
+
 def es_telefono_cordoba(formateado):
-    return bool(re.match(r'^(549|54)?351', re.sub(r'\D', '', formateado or '')))
+    """SOLO CELULARES: móvil argentino con característica 351 (Córdoba). Los fijos se descartan."""
+    d = re.sub(r'\D', '', str(formateado or ''))
+    return es_celular_argentino(d) and d.startswith('549351')
 
 
 PALABRAS_TELEFONO = ('tel', 'cel', 'whats', 'wsp', 'wpp', 'contact', 'llam', 'consult', 'ventas', 'pedidos')
 
 
 def telefonos_en_texto(bloque):
-    """Teléfonos publicados en la página, con su posición en el texto visible."""
+    """Celulares de Córdoba publicados en la página, con su posición en el texto visible."""
     visible = bloque.split('Contenido visible:', 1)[-1]
     encontrados = []
     for m in PATRON_TELEFONO.finditer(visible):
@@ -562,6 +597,10 @@ def telefonos_en_texto(bloque):
         for n in grupo.split(','):
             solo = re.sub(r'\D', '', n)
             if len(solo) >= 10:
+                # Un enlace de WhatsApp solo funciona con líneas móviles: si viene como 54351xxxxxxx
+                # (sin el 9), se lo normaliza al formato móvil 549351xxxxxxx.
+                if solo.startswith('54351') and len(solo) == 12:
+                    solo = '549' + solo[2:]
                 fmt = '+' + solo if solo.startswith('54') else limpiar_formato_celular(solo)
                 if es_telefono_cordoba(fmt):
                     encontrados.append((fmt, 10 ** 8))
@@ -595,6 +634,7 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
       b) Gemini la eligió entre los resultados de búsqueda (como haría una persona) Y alguna página
          del sitio confirma la calle y altura o el teléfono cargado en Odoo.
     Cuando un sitio es propio, TODAS sus páginas (contacto, nosotros, etc.) sirven.
+    Los teléfonos solo se aceptan si son CELULARES de Córdoba.
     """
     prioridad = {'oficial': 0, 'calle': 1}
     # Se usan los últimos 7 dígitos (sin código de área): así coincide aunque la página
@@ -782,7 +822,8 @@ def extraer_texto_de_url(url):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
             'Accept-Language': 'es-AR,es;q=0.9'
         }
-        response = requests.get(url, headers=headers, timeout=15)
+        # (conexión, lectura): una web caída ya no frena la corrida 15 segundos.
+        response = requests.get(url, headers=headers, timeout=(5, 10))
         if response.status_code != 200:
             return ""
         html = response.text[:1500000]
@@ -821,20 +862,37 @@ def extraer_texto_de_url(url):
         return ""
 
 
+def leer_paginas_en_paralelo(urls):
+    """Descarga varias páginas a la vez. Devuelve [(url, contenido)] en el mismo orden."""
+    if not urls:
+        return []
+    print(f"-> Leyendo {len(urls)} páginas en paralelo para encontrar email/contacto", flush=True)
+    with ThreadPoolExecutor(max_workers=MAX_HILOS_PAGINAS) as pool:
+        contenidos = list(pool.map(extraer_texto_de_url, urls))
+    return list(zip(urls, contenidos))
+
+
 # Según la prueba hecha desde GitHub: DuckDuckGo directo está bloqueado, "auto" y Yandex responden,
 # Google/Bing/Yahoo responden a medias. Se prueban en este orden hasta que uno devuelva resultados.
 BACKENDS_BUSQUEDA = ["auto", "yandex", "google", "bing", "yahoo"]
+_BACKEND_QUE_FUNCIONA = None  # Se recuerda el último que respondió para probarlo primero en la siguiente consulta
 
 
 def ejecutar_consulta_ddgs(query, max_res=7):
-    for backend in BACKENDS_BUSQUEDA:
+    global _BACKEND_QUE_FUNCIONA
+    orden = list(BACKENDS_BUSQUEDA)
+    if _BACKEND_QUE_FUNCIONA in orden:
+        orden.remove(_BACKEND_QUE_FUNCIONA)
+        orden.insert(0, _BACKEND_QUE_FUNCIONA)
+    for backend in orden:
         try:
             resultados = DDGS().text(query, region="ar-es", max_results=max_res, backend=backend)
             if resultados:
+                _BACKEND_QUE_FUNCIONA = backend
                 return resultados
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(PAUSA_ENTRE_BACKENDS)
     return []
 
 
@@ -943,7 +1001,7 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
                     resultados_urls.append((link, titulo, cuerpo))
         if bloques:
             reporte.append(f"=== {etiqueta} ===\n" + "\n".join(bloques))
-        time.sleep(2)
+        time.sleep(PAUSA_ENTRE_BUSQUEDAS)
 
     # Como lo haría una persona: de todos los resultados, elegir cuál es la web oficial del lead
     # (aunque su dominio sea una sigla, ej. "cobico.ar" para un colegio profesional).
@@ -957,7 +1015,11 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
             continue
         hosts_vistos.add(host)
         candidatos_oficiales.append((link, titulo, cuerpo))
-    elegidas = elegir_sitios_oficiales(lead, candidatos_oficiales)
+
+    # Velocidad: si algún resultado ya tiene un dominio que coincide con el nombre del lead, la web oficial
+    # se detecta sola (ver evaluar_evidencia) y no hace falta gastar una llamada a Gemini.
+    hay_dominio_coincidente = any(url_coincide_con_nombre(lead, u) for u, _, _ in candidatos_oficiales)
+    elegidas = [] if hay_dominio_coincidente else elegir_sitios_oficiales(lead, candidatos_oficiales)
     hosts_elegidos = {urlparse(u).netloc.lower().replace('www.', '') for u in elegidas}
     if elegidas:
         print(f"-> Sitio oficial elegido: {', '.join(sorted(hosts_elegidos))}", flush=True)
@@ -997,7 +1059,7 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
         p = urlparse(link)
         raiz = f"{p.scheme}://{p.netloc}"
         urls_oficiales.append(link)
-        for ruta in ('', '/contacto', '/contact', '/contactanos', '/nosotros'):
+        for ruta in ('', '/contacto', '/contact', '/nosotros'):
             urls_oficiales.append(raiz + ruta)
 
     # En los sitios que parecen del comercio, probar también las páginas de contacto habituales.
@@ -1006,35 +1068,38 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
         p = urlparse(link)
         if not any(d in p.netloc.lower() for d in DOMINIOS_SOCIALES) and url_coincide_con_nombre(lead, link):
             raiz = f"{p.scheme}://{p.netloc}"
-            for ruta in ('/contacto', '/contact', '/contactanos', '/nosotros'):
+            for ruta in ('/contacto', '/contact', '/nosotros'):
                 extras_contacto.append(raiz + ruta)
 
-    # Descargar páginas halladas y descubrir páginas internas de contacto.
-    pendientes = list(dict.fromkeys(urls_oficiales + urls_para_abrir + extras_contacto))
-    visitadas = set()
-    while pendientes and len(visitadas) < 20:
-        url = pendientes.pop(0)
-        if url in visitadas:
+    # Primera tanda: se descargan todas a la vez.
+    primera_tanda = list(dict.fromkeys(urls_oficiales + urls_para_abrir + extras_contacto))[:MAX_PAGINAS_PRIMERA_TANDA]
+    visitadas = set(primera_tanda)
+    descubiertas = []
+    for url, contenido in leer_paginas_en_paralelo(primera_tanda):
+        if not contenido:
             continue
-        visitadas.add(url)
-        print(f"-> Leyendo página para encontrar email/contacto: {url}", flush=True)
-        contenido = extraer_texto_de_url(url)
+        reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
+        host_url = urlparse(url).netloc.lower().replace('www.', '')
+        es_sitio_del_lead = url_coincide_con_nombre(lead, url) or host_url in hosts_elegidos
+        if not es_sitio_del_lead:
+            continue
+        for enlace in re.findall(r'https?://[^\s|\]]+', contenido):
+            if any(k in enlace.lower() for k in ('contact', 'contacto', 'nosotros', 'about', 'empresa')):
+                if enlace not in visitadas and enlace not in descubiertas and urlparse(enlace).netloc == urlparse(url).netloc:
+                    descubiertas.append(enlace)
+
+    # Segunda tanda: páginas internas de contacto descubiertas dentro de los sitios del lead, también en paralelo.
+    segunda_tanda = descubiertas[:MAX_PAGINAS_SEGUNDA_TANDA]
+    for url, contenido in leer_paginas_en_paralelo(segunda_tanda):
         if contenido:
             reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
-            host_url = urlparse(url).netloc.lower().replace('www.', '')
-            es_sitio_del_lead = url_coincide_con_nombre(lead, url) or host_url in hosts_elegidos
-            for enlace in re.findall(r'https?://[^\s|\]]+', contenido):
-                if any(k in enlace.lower() for k in ('contact', 'contacto', 'nosotros', 'about', 'empresa')):
-                    if es_sitio_del_lead and enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
-                        pendientes.insert(0, enlace)
-        time.sleep(0.7)
 
     evidencia = "\n\n".join(reporte).strip()
     if not evidencia:
         if reintento:
             # Casi siempre es un bloqueo momentáneo del buscador: se espera y se intenta una vez más (versión corta).
-            print("Sin resultados; se espera 30 segundos y se reintenta la búsqueda.", flush=True)
-            time.sleep(30)
+            print(f"Sin resultados; se espera {ESPERA_REINTENTO_BUSCADOR} segundos y se reintenta la búsqueda.", flush=True)
+            time.sleep(ESPERA_REINTENTO_BUSCADOR)
             return investigacion_profunda_con_google_search(lead, reintento=False)
         raise BusquedaSinEvidencia("DuckDuckGo no entregó resultados ni páginas verificables.")
     return evidencia
@@ -1066,7 +1131,7 @@ EVIDENCIA REUNIDA (resultados de búsqueda, HTML de webs y páginas internas):
 REGLAS:
 1. EMAIL: revisa todos los resultados y especialmente las secciones [EMAILS PUBLICADOS EN EL HTML], páginas de Contacto, Nosotros, pie de página y perfiles públicos de Facebook/Instagram. Si aparece un email que pertenece inequívocamente a este lead, devuelve email_elegido exactamente como está escrito y email_verificado=TRUE. Los emails de Gmail, Hotmail, Outlook o Yahoo son válidos si están publicados en la web o perfil del propio lead, o junto a su nombre y dirección. No uses correos técnicos, de plataformas, de directorios, de terceros ni de negocios homónimos.
 2. No marques email como no encontrado si la evidencia contiene un correo público claramente vinculado al lead. El email es prioritario y debe buscarse aunque ya exista teléfono.
-3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo usa un teléfono publicado y vinculado a la misma sucursal.
+3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo se aceptan CELULARES (móviles) de Córdoba; ignora teléfonos fijos. Solo usa un teléfono publicado y vinculado a la misma sucursal.
 4. IDENTIDAD: el nombre y la sucursal deben corresponder a este lead. No confundas sucursales, homónimos, marcas o localidades. El sitio web oficial puede tener un dominio que es una sigla y no se parece al nombre: si una página muestra el nombre (aunque sea con palabras de más o de menos, como "de la Provincia de Córdoba") y la misma dirección, es del lead.
 5. UBICACIÓN: solo Córdoba Capital, Córdoba, Argentina. No infieras la ubicación solo por el nombre de la ciudad.
 6. RUBRO: debe ser compatible con el lead de Odoo.
@@ -1191,6 +1256,7 @@ def ejecutar_agente():
             print(f"\n{motivo_corte}", flush=True)
             break
 
+        inicio_lead = time.time()
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         try:
             alcance = clasificar_alcance_geografico(lead)
@@ -1218,8 +1284,8 @@ def ejecutar_agente():
             # cada fuente debe nombrar Córdoba para poder aprobar (ver evaluar_evidencia).
             info_ddgs = investigacion_profunda_con_google_search(lead)
             sin_buscador_seguidos = 0  # el buscador respondió: se reinicia el contador de bloqueo
-            # Gemini solo se consulta si la búsqueda halló algo que confirmar (email, teléfono nuevo
-            # o el teléfono ya cargado visto junto al comercio): si no hay nada, no puede aportar.
+            # Gemini solo se consulta si la búsqueda halló algo que confirmar (email, celular nuevo
+            # o el celular ya cargado visto junto al comercio): si no hay nada, no puede aportar.
             vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
             previa = evaluar_evidencia(lead, info_ddgs, vacio, alcance)
             if previa['email'] or previa['telefono'] or previa['tel_cargado']:
@@ -1262,7 +1328,7 @@ def ejecutar_agente():
         telefono_actual = limpiar_formato_celular(lead.get('phone'))
 
         email_hallado = evidencia['email']        # (email, url) o None
-        telefono_hallado = evidencia['telefono']  # (telefono, url) o None
+        telefono_hallado = evidencia['telefono']  # (celular, url) o None
 
         # Un dato solo cuenta si coincide con el que ya está en Odoo, si Odoo lo tiene vacío
         # o si sale de la web propia del comercio. Si no, no se pisa nada y no se aprueba por él.
@@ -1277,11 +1343,13 @@ def ejecutar_agente():
         mismo_numero = False
         if telefono_hallado:
             mismo_numero = re.sub(r'\D', '', telefono_hallado[0])[-8:] == re.sub(r'\D', '', telefono_actual or '')[-8:]
-            if mismo_numero or not telefono_actual or evidencia['tel_oficial']:
+            # Si Odoo tiene un FIJO cargado, un celular verificado lo reemplaza (el fijo no sirve para WhatsApp).
+            odoo_tiene_celular = bool(telefono_actual) and es_celular_argentino(telefono_actual)
+            if mismo_numero or not odoo_tiene_celular or evidencia['tel_oficial']:
                 telefono_confirmado = telefono_hallado
             else:
-                sin_aplicar.append(f"teléfono {telefono_hallado[0]} (visto en {telefono_hallado[1] or 'búsqueda'})")
-        # El teléfono que ya estaba cargado en Odoo también queda verificado si aparece escrito
+                sin_aplicar.append(f"celular {telefono_hallado[0]} (visto en {telefono_hallado[1] or 'búsqueda'})")
+        # El celular que ya estaba cargado en Odoo también queda verificado si aparece escrito
         # junto al nombre del comercio en una página o resultado de búsqueda.
         if not telefono_confirmado and evidencia['tel_cargado'] and telefono_actual and es_telefono_cordoba(telefono_actual):
             telefono_confirmado = (telefono_actual, evidencia['tel_cargado'])
@@ -1319,14 +1387,14 @@ def ejecutar_agente():
             if evidencia['otros_emails']:
                 partes_nota.append("Otros emails también publicados por el comercio: " + ", ".join(evidencia['otros_emails']) + ".")
         if telefono_confirmado:
-            partes_nota.append(f"Teléfono confirmado: {telefono_confirmado[0]} (fuente: {telefono_confirmado[1] or 'resultado de búsqueda'}).")
+            partes_nota.append(f"Celular confirmado: {telefono_confirmado[0]} (fuente: {telefono_confirmado[1] or 'resultado de búsqueda'}).")
         partes_nota.extend(extra_nota)
         if sin_aplicar:
             partes_nota.append("NO se cambió porque no salió de la web propia del comercio y Odoo ya tenía otro dato: " + "; ".join(sin_aplicar) + ".")
         if not aprobado_final:
             faltantes = []
             if not contacto_verificado:
-                faltantes.append("no se confirmó email ni teléfono en una página que pertenezca claramente al comercio")
+                faltantes.append("no se confirmó email ni celular en una página que pertenezca claramente al comercio")
             if not evidencia['nombre_ok']:
                 faltantes.append("el nombre no apareció junto a la calle, el teléfono cargado o una web propia")
             if contacto_verificado and not resultado.coincide_ubicacion_y_rubro:
@@ -1339,12 +1407,13 @@ def ejecutar_agente():
                 vistos = [f"{t} (visto en {u or 'resultado de búsqueda'})" for t, u in evidencia['tel_debiles']]
                 if evidencia['tel_cargado_debil']:
                     vistos.append(f"el teléfono ya cargado (visto solo en {evidencia['tel_cargado_debil']})")
-                partes_nota.append("Teléfonos vistos sin respaldo suficiente: " + "; ".join(vistos) + ".")
+                partes_nota.append("Celulares vistos sin respaldo suficiente: " + "; ".join(vistos) + ".")
         if alcance == 'UBICACION_INCIERTA':
             partes_nota.append("Georef no confirmó la dirección exacta; se exigió que cada fuente nombrara Córdoba o la calle y número.")
 
         print(
-            f"Resultado: Aprobado={aprobado_final} | Email={email_confirmado} | Teléfono={telefono_confirmado}",
+            f"Resultado: Aprobado={aprobado_final} | Email={email_confirmado} | Celular={telefono_confirmado} "
+            f"| Tiempo del lead: {int(time.time() - inicio_lead)} s",
             flush=True
         )
 
