@@ -19,8 +19,9 @@ ODOO_USER = os.environ["ODOO_USER"]
 ODOO_API_KEY = os.environ["ODOO_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar
-ID_ETAPA_CHEQUEADO = 7  # Chequeado: solo debe quedar lo VERDE (verificado)
+ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
+ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
+ID_ETAPA_REVISAR = None  # <<< PONER ACÁ el número de la etapa "Revisar" (para revisión manual)
 MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
@@ -28,7 +29,7 @@ MODELO_GEMINI = "gemini-3.5-flash-lite"
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
 TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-HORAS_REINTENTO_PENDIENTES = 12           # Un lead que sigue en Prospectos no se vuelve a revisar antes de estas horas
+HORAS_REINTENTO_PENDIENTES = 12           # Un lead que sigue en Prospectos (por error) no se vuelve a revisar antes de estas horas
 
 # True = un email/teléfono solo se confirma si sale de la web propia del comercio (o su perfil de Facebook/Instagram)
 #        o si aparece en al menos 2 sitios distintos que nombran al comercio. Lo visto en un solo directorio NO alcanza.
@@ -999,9 +1000,9 @@ REGLAS:
 
 
 # Colores de la tarjeta en Odoo (sin color = todavía sin revisar)
-COLOR_PENDIENTE = 2       # naranja: revisado, no se pudo verificar (queda en Prospectos)
-COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital (queda en Prospectos)
-COLOR_APROBADO = 10       # verde: verificado con evidencia (único color que se queda en Chequeado)
+COLOR_PENDIENTE = 2       # naranja: no se pudo verificar (pasa a Revisar)
+COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital (pasa a Revisar)
+COLOR_APROBADO = 10       # verde: verificado con evidencia (pasa a Chequeado)
 
 
 def marcar_color(models, uid, lead_id, color):
@@ -1016,36 +1017,25 @@ def registrar_nota(models, uid, lead_id, nota):
 
 
 def ejecutar_agente():
+    if not ID_ETAPA_REVISAR:
+        raise SystemExit("Falta configurar ID_ETAPA_REVISAR (el número de la etapa 'Revisar' en Odoo). No se hizo ningún cambio.")
+
     print("Conectando a Odoo...", flush=True)
     uid, models = conectar_odoo()
 
     # Regla de las etapas:
-    #   - En Chequeado solo puede quedar lo VERDE (verificado con evidencia).
-    #   - Todo lo que no pueda verificarse (naranja, rojo, sin color, amarillo) vuelve a Prospectos.
-    #   - Los de Prospectos que se verifican pasan a Chequeado en verde.
+    #   - Solo se revisan los leads que están en Prospectos. Chequeado y Revisar no se tocan.
+    #   - Verificado -> Chequeado (verde).
+    #   - No verificado o fuera de Córdoba Capital -> Revisar (para revisión manual).
     # Las etiquetas nunca se modifican y no se crean leads nuevos.
     id_prospectos = ID_ETAPA_PROSPECTOS
     campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color']
 
-    # Se revisan: todo Prospectos + todo lo de Chequeado que NO sea verde.
-    dominio = [
-        '|', ['stage_id', '=', id_prospectos],
-        '&', ['stage_id', '=', ID_ETAPA_CHEQUEADO], ['color', '!=', COLOR_APROBADO]
-    ]
-    try:
-        todos_los_leads = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-            [dominio],
-            {'fields': campos, 'limit': 10000, 'order': 'id asc'}
-        )
-    except Exception as exc:
-        # Si esta versión de Odoo no tiene el campo de color, no se puede distinguir lo verde: solo se revisa Prospectos.
-        print(f"No se pudo usar el color en la consulta ({exc}); se revisa solo la etapa {id_prospectos}.", flush=True)
-        todos_los_leads = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
-            [[['stage_id', '=', id_prospectos]]],
-            {'fields': [c for c in campos if c != 'color'], 'limit': 10000, 'order': 'id asc'}
-        )
+    todos_los_leads = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
+        [[['stage_id', '=', id_prospectos]]],
+        {'fields': campos, 'limit': 10000, 'order': 'id asc'}
+    )
 
     # Las notas de "no devolvió evidencia suficiente" son fallas del buscador, no auditorías reales:
     # no cuentan como revisión hecha.
@@ -1064,30 +1054,14 @@ def ejecutar_agente():
 
     limite_pendientes = (datetime.now(timezone.utc) - timedelta(hours=HORAS_REINTENTO_PENDIENTES)).strftime('%Y-%m-%d %H:%M:%S')
 
-    def _etapa_id(l):
-        st = l.get('stage_id')
-        return st[0] if isinstance(st, (list, tuple)) and st else st
+    en_prospectos = len(todos_los_leads)
 
-    en_prospectos = sum(1 for l in todos_los_leads if _etapa_id(l) == id_prospectos)
-    en_chequeado_no_verde = len(todos_los_leads) - en_prospectos
+    # Un lead que sigue en Prospectos (por ejemplo, porque dio error) se vuelve a revisar
+    # si nunca se auditó o pasaron las horas de espera.
+    todos_los_leads = [l for l in todos_los_leads if ultima_auditoria.get(l['id'], '') < limite_pendientes]
 
-    # Lo que está en Chequeado sin ser verde se revisa siempre (hay que sacarlo o ponerlo en verde).
-    # Lo que está en Prospectos se revisa si nunca se auditó o pasaron las horas de espera.
-    def _toca_revisar(l):
-        if _etapa_id(l) == ID_ETAPA_CHEQUEADO:
-            return True
-        return ultima_auditoria.get(l['id'], '') < limite_pendientes
-
-    todos_los_leads = [l for l in todos_los_leads if _toca_revisar(l)]
-
-    # Primero lo de Chequeado no verde; luego los nunca auditados; luego los auditados hace más tiempo.
-    todos_los_leads.sort(
-        key=lambda lead: (
-            0 if _etapa_id(lead) == ID_ETAPA_CHEQUEADO else 1,
-            ultima_auditoria.get(lead['id'], ''),
-            lead['id']
-        )
-    )
+    # Primero los nunca auditados; luego los auditados hace más tiempo.
+    todos_los_leads.sort(key=lambda lead: (ultima_auditoria.get(lead['id'], ''), lead['id']))
 
     leads = todos_los_leads if not MAX_LEADS_POR_EJECUCION else todos_los_leads[:MAX_LEADS_POR_EJECUCION]
 
@@ -1104,8 +1078,8 @@ def ejecutar_agente():
         lead['_etiquetas'] = ' / '.join(nombres_tags.get(t, '') for t in (lead.get('tag_ids') or []) if nombres_tags.get(t))
 
     print(
-        f"Prospectos: {en_prospectos} | Chequeado NO verde (a revisar y limpiar): {en_chequeado_no_verde} | "
-        f"Les toca revisión ahora: {len(todos_los_leads)} | Lote de esta corrida: {len(leads)} | "
+        f"En Prospectos: {en_prospectos} | Les toca revisión ahora: {len(todos_los_leads)} | "
+        f"Lote de esta corrida: {len(leads)} | "
         f"Tiempo máximo: {TIEMPO_MAXIMO_SEGUNDOS // 60} min | Modelo: {MODELO_GEMINI}.",
         flush=True
     )
@@ -1113,9 +1087,9 @@ def ejecutar_agente():
         print("No hay leads pendientes para auditar.", flush=True)
         return
 
-    aprobados = 0          # quedaron o pasaron a Chequeado en verde
-    devueltos = 0          # estaban en Chequeado y volvieron a Prospectos
-    pendientes = 0         # siguen en Prospectos sin verificar
+    aprobados = 0          # pasaron a Chequeado en verde
+    a_revisar = 0          # pasaron a Revisar (no verificados)
+    pendientes = 0         # siguen en Prospectos por un error
     procesados = 0
     fallas_busqueda = 0
     fuera_alcance = 0
@@ -1128,18 +1102,11 @@ def ejecutar_agente():
             print(f"\n{motivo_corte}", flush=True)
             break
 
-        en_chequeado = (_etapa_id(lead) == ID_ETAPA_CHEQUEADO)
-        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] ({'en Chequeado' if en_chequeado else 'en Prospectos'}) (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
+        print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
         try:
             alcance = clasificar_alcance_geografico(lead)
 
             if alcance == 'FUERA_DE_ALCANCE':
-                if not en_chequeado and lead.get('color') == COLOR_FUERA_ALCANCE:
-                    # Ya estaba marcado en rojo en Prospectos: no se repite la nota.
-                    procesados += 1
-                    fuera_alcance += 1
-                    print("Fuera de alcance (ya marcado en rojo en Prospectos). Sin cambios.", flush=True)
-                    continue
                 provincia = lead.get('state_id')
                 pais = lead.get('country_id')
                 nota = (
@@ -1147,16 +1114,14 @@ def ejecutar_agente():
                     f"no corresponde a Córdoba Capital (ciudad: {lead.get('city') or 'sin ciudad'}, "
                     f"provincia: {provincia[1] if isinstance(provincia, (list, tuple)) and len(provincia) > 1 else 'sin provincia'}, "
                     f"país: {pais[1] if isinstance(pais, (list, tuple)) and len(pais) > 1 else 'sin país'}). "
-                    "No se realizó búsqueda ni se modificaron datos."
+                    "No se realizó búsqueda ni se modificaron datos. Pasa a Revisar para revisión manual."
                 )
-                if en_chequeado:
-                    nota += " Se devuelve de Chequeado a Prospectos."
-                    devueltos += 1
-                    models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], {'stage_id': id_prospectos}])
+                models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], {'stage_id': ID_ETAPA_REVISAR}])
                 registrar_nota(models, uid, lead['id'], nota)
                 marcar_color(models, uid, lead['id'], COLOR_FUERA_ALCANCE)
                 procesados += 1
                 fuera_alcance += 1
+                a_revisar += 1
                 print(nota, flush=True)
                 continue
 
@@ -1253,13 +1218,13 @@ def ejecutar_agente():
             valores_actualizar['phone'] = con_prefijo_mas(telefono_confirmado[0])
             if telefono_actual:
                 extra_nota.append(f"El teléfono anterior era {telefono_actual}.")
-        # Solo verde en Chequeado: verificado -> Chequeado; no verificado -> Prospectos.
-        valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO if aprobado_final else id_prospectos
+        # Verificado -> Chequeado (verde); no verificado -> Revisar (revisión manual).
+        valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO if aprobado_final else ID_ETAPA_REVISAR
 
         if aprobado_final:
-            partes_nota.append("APROBADO (verde): contacto verificado con evidencia." + (" Queda en Chequeado." if en_chequeado else " Pasa a Chequeado."))
+            partes_nota.append("APROBADO (verde): contacto verificado con evidencia. Pasa a Chequeado.")
         else:
-            partes_nota.append("PENDIENTE." + (" Se devuelve de Chequeado a Prospectos porque no se pudo verificar." if en_chequeado else " Queda en Prospectos."))
+            partes_nota.append("PENDIENTE: no se pudo verificar. Pasa a Revisar para revisión manual.")
         if email_confirmado:
             partes_nota.append(f"Email confirmado: {email_confirmado[0]} (fuente: {email_confirmado[1] or 'resultado de búsqueda'}).")
             if evidencia['otros_emails']:
@@ -1302,16 +1267,14 @@ def ejecutar_agente():
         procesados += 1
         if aprobado_final:
             aprobados += 1
-        elif en_chequeado:
-            devueltos += 1
         else:
-            pendientes += 1
+            a_revisar += 1
 
     minutos = int((time.time() - INICIO_EJECUCION) / 60)
     print(
         f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | verdes_en_Chequeado={aprobados} "
-        f"| devueltos_a_Prospectos={devueltos} | siguen_en_Prospectos={pendientes} | fuera_alcance={fuera_alcance} "
-        f"| sin_resultados_del_buscador={fallas_busqueda} | sin_tocar={len(leads) - procesados - fallas_busqueda}",
+        f"| pasados_a_Revisar={a_revisar} (de ellos fuera_alcance={fuera_alcance}) | siguen_en_Prospectos_por_error={pendientes} "
+        f"| sin_resultados_del_buscador={fallas_busqueda} | sin_tocar={len(leads) - procesados - fallas_busqueda - pendientes}",
         flush=True
     )
     if motivo_corte:
