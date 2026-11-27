@@ -24,7 +24,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
 ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
 ID_ETAPA_REVISAR = 11    # Revisar: revisión manual
-MAX_LEADS_POR_EJECUCION = 10  # None = todos los que haya en Prospectos; el límite real es el tiempo máximo de abajo.
+MAX_LEADS_POR_EJECUCION = None  # None = todos los que haya en Prospectos; el límite real es el tiempo máximo de abajo.
+SOLO_IDS = [1512, 1130, 1518, 665]  # Para probar: IDs de leads que estén en Prospectos, ej. [1512, 1130, 1518, 665]. Vacío = todos.
 INTERVALO_GEMINI_SEGUNDOS = 4.2  # Separación mínima entre llamadas a Gemini (ya no se suma al resto del trabajo)
 MODELO_GEMINI = "gemini-3.5-flash-lite"
 
@@ -35,7 +36,7 @@ HORAS_REINTENTO_PENDIENTES = 0             # Un lead que sigue en Prospectos (po
 
 # --- Velocidad ---
 MAX_HILOS_PAGINAS = 8              # Páginas web que se descargan al mismo tiempo
-MAX_PAGINAS_PRIMERA_TANDA = 14     # Páginas de la primera descarga paralela
+MAX_PAGINAS_PRIMERA_TANDA = 18     # Páginas de la primera descarga paralela
 MAX_PAGINAS_SEGUNDA_TANDA = 6      # Páginas internas de contacto descubiertas en la primera tanda
 PAUSA_ENTRE_BUSQUEDAS = 0.7        # Antes 2 s
 PAUSA_ENTRE_BACKENDS = 0.5         # Antes 1.5 s
@@ -62,7 +63,7 @@ DOMINIOS_DIRECTORIO = (
     'zoominfo.', 'ubereats.', 'indeed.', 'glassdoor.', 'linkedin.',
     'facebook.com', 'instagram.com', 'wikipedia.org', 'google.com'
 )
-DOMINIOS_SOCIALES = ('facebook.com', 'instagram.com')
+DOMINIOS_SOCIALES = ('facebook.com', 'instagram.com', 'linktr.ee')
 EMAILS_BASURA = (
     'sentry.io', 'wixpress.com', 'example.com', 'godaddy', 'squarespace',
     'wordpress.com', 'domain.com', 'tuemail', 'tucorreo', 'tumail',
@@ -379,7 +380,7 @@ def limpiar_nombre_busqueda(nombre):
     # Quita la sucursal entre corchetes. Si hay un guion largo ("Marca – Rubro"), prueba primero
     # la parte anterior y, si esa quedó sin contenido real (ej. "en Córdoba"), prueba la posterior.
     nombre = re.sub(r'\[.*?\]', '', nombre or '').strip()
-    partes = [p.strip() for p in re.split(r'\s[–—-]\s|\s\|\s|\s::\s', nombre, maxsplit=1)]
+    partes = [p.strip() for p in re.split(r'\s[–—-]\s|\s\|\s|\s::\s|\s/\s', nombre, maxsplit=1)]
     if len(partes) == 2 and len(partes[0]) >= 4:
         candidatos = [partes[0], partes[1]]
     else:
@@ -499,7 +500,15 @@ def texto_coincide_con_nombre(lead, texto_compacto):
     distintivos = [t for t in corto.split()
                    if len(t) >= 3 and t not in PALABRAS_NOMBRE_GENERICAS
                    and t not in RUBROS_NORMALIZADOS and t not in PALABRAS_VACIAS_NOMBRE]
-    return bool(distintivos) and sum(len(t) for t in distintivos) >= 5 and all(t in texto_compacto for t in distintivos)
+    if distintivos and sum(len(t) for t in distintivos) >= 5 and all(t in texto_compacto for t in distintivos):
+        return True
+    # Nombres largos: las webs suelen acortarlos ("Brosas Frescas de Ternera" -> brosasfrescas.com.ar).
+    # Con 3 o más palabras distintivas alcanza con las dos primeras juntas (mínimo 9 letras).
+    if len(distintivos) >= 3:
+        inicio = distintivos[0] + distintivos[1]
+        if len(inicio) >= 9 and inicio in texto_compacto:
+            return True
+    return False
 
 
 def url_coincide_con_nombre(lead, url):
@@ -574,6 +583,15 @@ def es_telefono_cordoba(formateado):
     return es_celular_argentino(d) and d.startswith('549351')
 
 
+RE_WHATSAPP_ANTES = re.compile(r'(?:whats\s?app|wsp|wpp)\W{0,6}$', re.I)
+RE_WHATSAPP_DESPUES = re.compile(r'^[\s*(\-–:]*(?:solo\s+|por\s+)?(?:whats\s?app|wsp|wpp)', re.I)
+
+
+def _rotulado_whatsapp(antes, despues):
+    """True si el número está pegado a la palabra WhatsApp (antes o inmediatamente después)."""
+    return bool(RE_WHATSAPP_ANTES.search(antes[-20:]) or RE_WHATSAPP_DESPUES.match(despues[:25]))
+
+
 PALABRAS_TELEFONO = ('tel', 'cel', 'whats', 'wsp', 'wpp', 'contact', 'llam', 'consult', 'ventas', 'pedidos')
 
 
@@ -591,6 +609,9 @@ def telefonos_en_texto(bloque):
         con_prefijo = crudo.strip().startswith('+54') or solo.startswith(('54', '0351', '351'))
         if con_palabra or con_prefijo:
             formateado = limpiar_formato_celular(crudo)
+            # Un número de Córdoba escrito sin 9 ni 15 pero rotulado "WhatsApp" es móvil (WhatsApp usa líneas móviles).
+            if formateado and re.fullmatch(r'\+54351\d{7}', formateado) and _rotulado_whatsapp(antes, visible[m.end():m.end() + 25]):
+                formateado = '+549' + formateado[3:]
             if formateado and es_telefono_cordoba(formateado):
                 encontrados.append((formateado, m.start()))
     for grupo in re.findall(r'WHATSAPP PUBLICADO:\s*([0-9,\s]+)', bloque):
@@ -1020,6 +1041,17 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
     # se detecta sola (ver evaluar_evidencia) y no hace falta gastar una llamada a Gemini.
     hay_dominio_coincidente = any(url_coincide_con_nombre(lead, u) for u, _, _ in candidatos_oficiales)
     elegidas = [] if hay_dominio_coincidente else elegir_sitios_oficiales(lead, candidatos_oficiales)
+    # El sitio web que ya está cargado en Odoo se abre siempre. Sigue valiendo la regla de seguridad:
+    # solo se vuelve "web propia" si alguna de sus páginas confirma la calle y altura o el teléfono cargado.
+    sitio_odoo = (lead.get('website') or '').strip()
+    if sitio_odoo and not sitio_odoo.lower().startswith('http'):
+        sitio_odoo = 'http://' + sitio_odoo
+    host_odoo = urlparse(sitio_odoo).netloc.lower().replace('www.', '') if sitio_odoo else ''
+    if host_odoo and (any(d in host_odoo for d in DOMINIOS_DIRECTORIO) or any(d in host_odoo for d in DOMINIOS_SOCIALES) or dominio_extranjero(host_odoo)):
+        sitio_odoo = ''
+    if sitio_odoo and sitio_odoo not in elegidas:
+        elegidas.insert(0, sitio_odoo)
+        print(f"-> Sitio web cargado en Odoo: {sitio_odoo}", flush=True)
     hosts_elegidos = {urlparse(u).netloc.lower().replace('www.', '') for u in elegidas}
     if elegidas:
         print(f"-> Sitio oficial elegido: {', '.join(sorted(hosts_elegidos))}", flush=True)
@@ -1059,6 +1091,8 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
         p = urlparse(link)
         raiz = f"{p.scheme}://{p.netloc}"
         urls_oficiales.append(link)
+        if any(d in p.netloc.lower() for d in DOMINIOS_SOCIALES):
+            continue
         for ruta in ('', '/contacto', '/contact', '/nosotros'):
             urls_oficiales.append(raiz + ruta)
 
@@ -1213,6 +1247,9 @@ def ejecutar_agente():
     # Un lead que sigue en Prospectos (por ejemplo, porque dio error) se vuelve a revisar
     # si nunca se auditó o pasaron las horas de espera.
     todos_los_leads = [l for l in todos_los_leads if ultima_auditoria.get(l['id'], '') < limite_pendientes]
+
+    if SOLO_IDS:
+        todos_los_leads = [l for l in todos_los_leads if l['id'] in SOLO_IDS]
 
     # Primero los nunca auditados; luego los auditados hace más tiempo.
     todos_los_leads.sort(key=lambda lead: (ultima_auditoria.get(lead['id'], ''), lead['id']))
