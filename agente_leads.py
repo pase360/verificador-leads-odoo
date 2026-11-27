@@ -11,6 +11,7 @@ from ddgs import DDGS
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+from typing import List
 
 # Configuración desde los Secretos de GitHub
 ODOO_URL = os.environ["ODOO_URL"]
@@ -21,7 +22,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
 ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
-ID_ETAPA_REVISAR = 11  # <<< PONER ACÁ el número de la etapa "Revisar" (para revisión manual)
+ID_ETAPA_REVISAR = 11    # Revisar: revisión manual
 MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
@@ -29,7 +30,7 @@ MODELO_GEMINI = "gemini-3.5-flash-lite"
 # --- Protecciones para que la corrida nunca llegue al límite de 6 horas de GitHub ---
 TIEMPO_MAXIMO_SEGUNDOS = int(3.5 * 3600)  # Al llegar a este tiempo corta limpio y termina en verde
 MAX_SIN_BUSCADOR_SEGUIDOS = 5             # Si 5 leads seguidos no reciben NINGÚN resultado, el buscador está bloqueado: se aborta
-HORAS_REINTENTO_PENDIENTES = 0           # Un lead que sigue en Prospectos (por error) no se vuelve a revisar antes de estas horas
+HORAS_REINTENTO_PENDIENTES = 0            # Un lead que sigue en Prospectos (por error) se vuelve a revisar en la próxima corrida
 
 # True = un email/teléfono solo se confirma si sale de la web propia del comercio (o su perfil de Facebook/Instagram)
 #        o si aparece en al menos 2 sitios distintos que nombran al comercio. Lo visto en un solo directorio NO alcanza.
@@ -86,6 +87,10 @@ class ResultadoValidacion(BaseModel):
     coincide_ubicacion_y_rubro: bool
     datos_validos_y_verificados: bool
     motivo: str
+
+
+class SitiosOficiales(BaseModel):
+    urls: List[str]
 
 
 class BusquedaSinEvidencia(Exception):
@@ -585,12 +590,11 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
       tel_cargado: URL que respalda el teléfono ya cargado en Odoo (o None)
       candidatos / tel_debiles: datos vistos pero SIN respaldo suficiente (solo para la nota)
 
-    Un dato solo se confirma si (EXIGIR_FUENTE_PROPIA_O_DOBLE):
-      - aparece en la web propia del comercio (cualquiera de sus páginas) o en su perfil de Facebook/Instagram, o
-      - aparece en al menos 2 sitios distintos, cada uno nombrando al comercio.
-    La web propia se identifica a nivel de SITIO: si el dominio coincide con el nombre y alguna página del
-    sitio confirma calle, teléfono cargado o Córdoba, TODAS las páginas de ese dominio (contacto, nosotros, etc.)
-    sirven, aunque el dato esté repartido en varias páginas.
+    La web propia se identifica a nivel de SITIO de dos maneras:
+      a) el dominio coincide con el nombre del comercio, o
+      b) Gemini la eligió entre los resultados de búsqueda (como haría una persona) Y alguna página
+         del sitio confirma la calle y altura o el teléfono cargado en Odoo.
+    Cuando un sitio es propio, TODAS sus páginas (contacto, nosotros, etc.) sirven.
     """
     prioridad = {'oficial': 0, 'calle': 1}
     # Se usan los últimos 7 dígitos (sin código de área): así coincide aunque la página
@@ -603,6 +607,7 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
     email_ia = email_util(resultado.email_elegido)
     exigir_cordoba = (alcance == 'UBICACION_INCIERTA')
     bloques = separar_bloques(evidencia)
+    sitios_elegidos = set(re.findall(r'SITIO OFICIAL ELEGIDO:\s*(\S+)', evidencia))
 
     # Paso 1: sitios propios (a nivel de dominio completo).
     dominios_propios = set()
@@ -613,11 +618,13 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
         host = urlparse(url).netloc.lower().replace('www.', '')
         if any(d in host for d in DOMINIOS_SOCIALES) or dominio_extranjero(host):
             continue
-        if not url_coincide_con_nombre(lead, url):
+        nombre_en_url = url_coincide_con_nombre(lead, url)
+        if not nombre_en_url and host not in sitios_elegidos:
             continue
         bloque_n = normalizar_texto(bloque)
         digitos = re.sub(r'\D', '', bloque)
-        if calle_confirmada(lead, bloque_n) or (telefono_lead and telefono_lead in digitos) or 'cordoba' in bloque_n:
+        confirma_dato = calle_confirmada(lead, bloque_n) or (telefono_lead and telefono_lead in digitos)
+        if confirma_dato or (nombre_en_url and 'cordoba' in bloque_n):
             dominios_propios.add(host)
 
     confirmados = {}   # email -> (tipo, rango, pos, orden, url)
@@ -670,12 +677,15 @@ def evaluar_evidencia(lead, evidencia, resultado, alcance):
                 aceptado = con_nombre or host_bloque in dominios_propios
                 rango = 10
             else:
-                aceptado = (
+                coincide = (
                     email_coincide_con_nombre(lead, e)
-                    or (host_bloque and dominio in host_bloque)
+                    or bool(host_bloque and dominio in host_bloque)
                     or tipo == 'calle'
                 )
-                rango = 0
+                # Un correo publicado en la web propia del comercio es suyo aunque su dominio
+                # no se parezca al nombre (ej. sitio "cobico.ar" con correo "cobico.com.ar").
+                aceptado = coincide or host_bloque in dominios_propios
+                rango = 0 if coincide else 3
             if aceptado and elegible:
                 pos = visible.find(e)
                 orden += 1
@@ -828,6 +838,56 @@ def ejecutar_consulta_ddgs(query, max_res=7):
     return []
 
 
+def elegir_sitios_oficiales(lead, candidatos):
+    """
+    Hace lo que haría una persona: mira los resultados de la búsqueda del nombre y elige cuál es
+    la web oficial del lead (aunque el dominio sea una sigla que no se parece al nombre).
+    candidatos: lista de (url, titulo, texto). Devuelve una lista de URLs elegidas (máx. 3).
+    """
+    if not candidatos:
+        return []
+    nombre_original = lead.get('partner_name') or lead.get('name') or ''
+    direccion = lead.get('street') or 'No especificada'
+    listado = "\n".join(
+        f"{i + 1}. URL: {u}\n   Título: {t}\n   Texto: {c}" for i, (u, t, c) in enumerate(candidatos[:15])
+    )
+    prompt = f"""
+Buscaste en internet el nombre de este comercio o institución y tenés que decidir cuál es su SITIO WEB OFICIAL, como lo haría una persona mirando los resultados de Google.
+
+LEAD:
+- Nombre: {nombre_original}
+- Dirección: {direccion}
+- Ciudad: Córdoba Capital, Córdoba, Argentina
+
+RESULTADOS:
+{listado}
+
+REGLAS:
+- Elegí hasta 3 URLs de la lista que sean la web oficial del lead (o una página de esa web oficial).
+- El dominio puede ser una sigla o un nombre distinto al del lead: lo importante es que el título o el texto muestren que es SU sitio.
+- No elijas directorios, noticias, buscadores de empresas, ni sitios de otra ciudad o provincia con nombre parecido (por ejemplo una filial de otra provincia).
+- Copiá las URLs exactamente como están en la lista. Si ninguna es la web oficial, devolvé una lista vacía.
+"""
+    try:
+        response = generar_con_gemini(
+            model=MODELO_GEMINI,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SitiosOficiales,
+                temperature=0.0,
+            ),
+        )
+        urls_validas = {u for u, _, _ in candidatos}
+        elegidas = [u for u in (response.parsed.urls if response.parsed else []) if u in urls_validas]
+        return elegidas[:3]
+    except (CuotaGeminiAgotada, ServicioGeminiTemporal):
+        raise
+    except Exception as exc:
+        print(f"No se pudo elegir el sitio oficial con Gemini: {exc}", flush=True)
+        return []
+
+
 def investigacion_profunda_con_google_search(lead, reintento=True):
     """Busca primero emails: buscador, web oficial, páginas internas y redes públicas."""
     nombre_original = lead.get('partner_name') or lead.get('name') or ''
@@ -885,6 +945,24 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
             reporte.append(f"=== {etiqueta} ===\n" + "\n".join(bloques))
         time.sleep(2)
 
+    # Como lo haría una persona: de todos los resultados, elegir cuál es la web oficial del lead
+    # (aunque su dominio sea una sigla, ej. "cobico.ar" para un colegio profesional).
+    candidatos_oficiales = []
+    hosts_vistos = set()
+    for link, titulo, cuerpo in resultados_urls:
+        host = urlparse(link).netloc.lower().replace('www.', '')
+        if not host or host in hosts_vistos:
+            continue
+        if any(d in host for d in DOMINIOS_DIRECTORIO) or dominio_extranjero(host):
+            continue
+        hosts_vistos.add(host)
+        candidatos_oficiales.append((link, titulo, cuerpo))
+    elegidas = elegir_sitios_oficiales(lead, candidatos_oficiales)
+    hosts_elegidos = {urlparse(u).netloc.lower().replace('www.', '') for u in elegidas}
+    if elegidas:
+        print(f"-> Sitio oficial elegido: {', '.join(sorted(hosts_elegidos))}", flush=True)
+        reporte.insert(0, "=== SITIOS OFICIALES ELEGIDOS ===\n" + "\n".join(f"SITIO OFICIAL ELEGIDO: {h}" for h in sorted(hosts_elegidos)))
+
     # Priorizar sitios propios; los resultados de redes quedan como evidencia de perfil.
     def puntuacion(item):
         link, titulo, cuerpo = item
@@ -913,6 +991,15 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
     resultados_urls.sort(key=puntuacion, reverse=True)
     urls_para_abrir = [x[0] for x in resultados_urls[:8]]
 
+    # Sitio oficial elegido: se abre la página elegida, la portada y las páginas de contacto habituales.
+    urls_oficiales = []
+    for link in elegidas:
+        p = urlparse(link)
+        raiz = f"{p.scheme}://{p.netloc}"
+        urls_oficiales.append(link)
+        for ruta in ('', '/contacto', '/contact', '/contactanos', '/nosotros'):
+            urls_oficiales.append(raiz + ruta)
+
     # En los sitios que parecen del comercio, probar también las páginas de contacto habituales.
     extras_contacto = []
     for link in urls_para_abrir:
@@ -923,9 +1010,9 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
                 extras_contacto.append(raiz + ruta)
 
     # Descargar páginas halladas y descubrir páginas internas de contacto.
-    pendientes = list(dict.fromkeys(urls_para_abrir + extras_contacto))
+    pendientes = list(dict.fromkeys(urls_oficiales + urls_para_abrir + extras_contacto))
     visitadas = set()
-    while pendientes and len(visitadas) < 16:
+    while pendientes and len(visitadas) < 20:
         url = pendientes.pop(0)
         if url in visitadas:
             continue
@@ -934,9 +1021,11 @@ def investigacion_profunda_con_google_search(lead, reintento=True):
         contenido = extraer_texto_de_url(url)
         if contenido:
             reporte.append(f"\n=== FUENTE INDIVIDUAL ===\nURL: {url}\n{contenido}")
+            host_url = urlparse(url).netloc.lower().replace('www.', '')
+            es_sitio_del_lead = url_coincide_con_nombre(lead, url) or host_url in hosts_elegidos
             for enlace in re.findall(r'https?://[^\s|\]]+', contenido):
                 if any(k in enlace.lower() for k in ('contact', 'contacto', 'nosotros', 'about', 'empresa')):
-                    if url_coincide_con_nombre(lead, url) and enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
+                    if es_sitio_del_lead and enlace not in visitadas and enlace not in pendientes and urlparse(enlace).netloc == urlparse(url).netloc:
                         pendientes.insert(0, enlace)
         time.sleep(0.7)
 
@@ -978,7 +1067,7 @@ REGLAS:
 1. EMAIL: revisa todos los resultados y especialmente las secciones [EMAILS PUBLICADOS EN EL HTML], páginas de Contacto, Nosotros, pie de página y perfiles públicos de Facebook/Instagram. Si aparece un email que pertenece inequívocamente a este lead, devuelve email_elegido exactamente como está escrito y email_verificado=TRUE. Los emails de Gmail, Hotmail, Outlook o Yahoo son válidos si están publicados en la web o perfil del propio lead, o junto a su nombre y dirección. No uses correos técnicos, de plataformas, de directorios, de terceros ni de negocios homónimos.
 2. No marques email como no encontrado si la evidencia contiene un correo público claramente vinculado al lead. El email es prioritario y debe buscarse aunque ya exista teléfono.
 3. TELÉFONO: puede verificarse como alternativa si no se encuentra email. Solo usa un teléfono publicado y vinculado a la misma sucursal.
-4. IDENTIDAD: el nombre y la sucursal deben corresponder a este lead. No confundas sucursales, homónimos, marcas o localidades.
+4. IDENTIDAD: el nombre y la sucursal deben corresponder a este lead. No confundas sucursales, homónimos, marcas o localidades. El sitio web oficial puede tener un dominio que es una sigla y no se parece al nombre: si una página muestra el nombre (aunque sea con palabras de más o de menos, como "de la Provincia de Córdoba") y la misma dirección, es del lead.
 5. UBICACIÓN: solo Córdoba Capital, Córdoba, Argentina. No infieras la ubicación solo por el nombre de la ciudad.
 6. RUBRO: debe ser compatible con el lead de Odoo.
 7. Nunca inventes ni completes datos por intuición. Usa únicamente la evidencia incluida y copia los datos exactamente.
