@@ -21,7 +21,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 ID_ETAPA_PROSPECTOS = 5  # Prospectos por Controlar: única etapa que se revisa
 ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
-ID_ETAPA_REVISAR = None  # <<< PONER ACÁ el número de la etapa "Revisar" (para revisión manual)
+ID_ETAPA_REVISAR = 11  # <<< PONER ACÁ el número de la etapa "Revisar" (para revisión manual)
 MAX_LEADS_POR_EJECUCION = 60  # Lote por corrida (None = sin límite). Con 4 corridas diarias alcanza de sobra.
 INTERVALO_GEMINI_SEGUNDOS = 4.2
 MODELO_GEMINI = "gemini-3.5-flash-lite"
