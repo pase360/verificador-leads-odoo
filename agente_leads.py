@@ -5,6 +5,7 @@ import unicodedata
 from types import SimpleNamespace
 import xmlrpc.client
 import requests
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
@@ -26,6 +27,13 @@ ID_ETAPA_CHEQUEADO = 7   # Chequeado: solo reciben leads VERDES (verificados)
 ID_ETAPA_REVISAR = 11    # Revisar: revisión manual
 MAX_LEADS_POR_EJECUCION = None  # None = todos los que haya en Prospectos; el límite real es el tiempo máximo de abajo.
 SOLO_IDS = []  # Para probar: IDs de leads que estén en Prospectos, ej. [1512, 1130, 1518, 665]. Vacío = todos.
+# True = un lead cargado desde Google Maps, con celular de Córdoba (351) y dirección confirmada en Córdoba Capital, pasa a
+#        Chequeado en CELESTE aunque no haya una segunda fuente en internet (la mayoría de los comercios chicos no la tienen).
+#        Sigue yendo a Revisar si cerró, si la ubicación no es clara o si el celular no es de Córdoba.
+# False = solo pasa a Chequeado lo que se confirma en internet (verde); el resto va a Revisar.
+ACEPTAR_DATO_DE_GOOGLE_MAPS = True
+# Si el buscador no devuelve NADA para un mismo lead en tantas corridas, se decide con los datos de Odoo (para no dejarlo en Prospectos).
+INTENTOS_SIN_RESULTADOS_ANTES_DE_DECIDIR = 2
 INTERVALO_GEMINI_SEGUNDOS = 4.2  # Separación mínima entre llamadas a Gemini (ya no se suma al resto del trabajo)
 MODELO_GEMINI = "gemini-3.5-flash-lite"
 
@@ -263,6 +271,17 @@ def consultar_georef_direccion(lead, codigo_postal):
     )
 
 
+def localidad_tras_cp(direccion):
+    """Localidad que acompaña al CP en su tramo de la dirección: 'X5885 Villa de Las Rosas' -> 'villa de las rosas'."""
+    for parte in str(direccion or '').split(','):
+        if not re.search(r'(?<![A-Z0-9])[A-Z]\d{4}(?:[A-Z]{3})?(?![A-Z0-9])', parte.upper()):
+            continue
+        resto = re.sub(r'(?<![A-Za-z0-9])[A-Za-z]\d{4}(?:[A-Za-z]{3})?(?![A-Za-z0-9])', ' ', parte)
+        resto = re.sub(r'\b[A-Z]{2,3}\b', ' ', resto)   # sufijos de CPA sueltos ("X5000 BVD")
+        return normalizar_texto(resto)
+    return ''
+
+
 def clasificar_alcance_geografico(lead):
     """Devuelve CORDOBA_CAPITAL, FUERA_DE_ALCANCE o UBICACION_INCIERTA."""
     ciudad = normalizar_texto(lead.get('city') or '')
@@ -332,14 +351,23 @@ def clasificar_alcance_geografico(lead):
         return 'UBICACION_INCIERTA'
     codigo_postal = codigos[0] if codigos else ''
     if codigo_postal:
-        # La primera letra del CPA identifica la provincia. X corresponde a Córdoba;
-        # el segundo carácter debe ser 5. X5 incluye muchas localidades, no solo Capital.
-        if not codigo_postal.startswith('X5'):
+        # La primera letra del CPA identifica la provincia: X es Córdoba, cualquier otra letra es otra provincia.
+        if codigo_postal[0] != 'X':
             return 'FUERA_DE_ALCANCE'
         numero_cp = int(codigo_postal[1:5])
-        if not (5000 <= numero_cp <= 5023 or numero_cp in (5147, 5149)):
+        if numero_cp // 1000 == 5:
+            if 5000 <= numero_cp <= 5023 or numero_cp in (5147, 5149):
+                # CP de Córdoba Capital informado en la dirección: alcanza para ubicar el lead sin consultar Georef.
+                print(f"Validación geográfica: CP={codigo_postal} corresponde a Córdoba Capital.", flush=True)
+                return 'CORDOBA_CAPITAL'
+            # X5xxx fuera del rango de Capital: si la localidad escrita junto al CP no es Córdoba, está fuera de alcance.
+            localidad = localidad_tras_cp(lead.get('street'))
+            if localidad and not any(t in ('cordoba', 'capital') for t in localidad.split()):
+                print(f"Validación geográfica: CP={codigo_postal} y localidad '{localidad}': fuera de Córdoba Capital.", flush=True)
+                return 'FUERA_DE_ALCANCE'
             print(f"Ubicación pendiente: el CP {codigo_postal} no corresponde a Córdoba Capital; se exige evidencia explícita.", flush=True)
             return 'UBICACION_INCIERTA'
+        print(f"CP {codigo_postal} con formato dudoso (X pero no X5xxx): se intenta confirmar la dirección con Georef.", flush=True)
 
     alcance, detalle = consultar_georef_direccion(lead, codigo_postal)
     print(
@@ -1193,6 +1221,7 @@ REGLAS:
 COLOR_PENDIENTE = 2       # naranja: no se pudo verificar (pasa a Revisar)
 COLOR_FUERA_ALCANCE = 1   # rojo: fuera de Córdoba Capital (pasa a Revisar)
 COLOR_APROBADO = 10       # verde: verificado con evidencia (pasa a Chequeado)
+COLOR_DATO_GOOGLE_MAPS = 4  # celeste: dato de Google Maps sin segunda fuente (pasa a Chequeado, confianza media)
 
 
 def marcar_color(models, uid, lead_id, color):
@@ -1231,6 +1260,79 @@ def decidir_telefono(telefono_actual, evidencia):
     return None, False, sin_aplicar, otros
 
 
+PATRON_COMERCIO_CERRADO = re.compile(
+    r'no existe m[aá]s|otros due[ñn]os|cerrad[oa] (?:definitiva|permanente)mente|permanentemente cerrad|'
+    r'cerr[oó] definitivamente|vendi[oó]|se mud[oó]|ya no (?:existe|funciona|atiende)|fuera de servicio', re.I)
+
+
+def limpiar_html(texto):
+    texto = re.sub(r'<[^>]+>', ' ', str(texto or ''))
+    return re.sub(r'\s+', ' ', texto.replace('&nbsp;', ' ').replace('&amp;', '&')).strip()
+
+
+def evaluar_dato_de_google_maps(lead, alcance):
+    """
+    Segundo nivel de aprobación (celeste). Devuelve (aprobado, motivo).
+    Pasa si el lead se cargó desde Google Maps, la dirección está confirmada en Córdoba Capital, el teléfono cargado
+    es un celular de Córdoba (351) y nada indica que el comercio cerró o cambió de dueño.
+    No sirve para datos nuevos: solo valida lo que ya está cargado en Odoo.
+    """
+    descripcion = limpiar_html(lead.get('description'))
+    if 'google maps' not in descripcion.lower():
+        return False, 'el lead no figura como cargado desde Google Maps'
+    if alcance != 'CORDOBA_CAPITAL':
+        return False, 'la ubicación en Córdoba Capital no está confirmada'
+    telefono = limpiar_formato_celular(lead.get('phone'))
+    if not es_telefono_cordoba(telefono):
+        return False, 'el teléfono cargado no es un celular de Córdoba (351)'
+    texto = ' '.join([str(lead.get('partner_name') or ''), str(lead.get('name') or ''), str(lead.get('street') or ''), descripcion])
+    if PATRON_COMERCIO_CERRADO.search(texto):
+        return False, 'el nombre o la dirección indican que el comercio cerró o cambió de dueño'
+    calidad = 'marcado como "probable"' if 'probable' in descripcion.lower() else 'confirmado por WhatsApp o por su formato de celular'
+    return True, (
+        f"El celular {telefono} ya estaba cargado en Odoo ({calidad}), tiene formato de celular de Córdoba y la dirección "
+        "está en Córdoba Capital. No se halló nada que lo contradiga."
+    )
+
+
+def reclasificar_revisar(aplicar=False):
+    """
+    Revisa los leads que están en Revisar SIN buscar en internet: los que cumplen el segundo nivel (celeste) pasan a
+    Chequeado. Con aplicar=False solo muestra qué haría (no cambia nada en Odoo).
+    """
+    print(f"Reclasificando los leads en Revisar | {'APLICANDO CAMBIOS' if aplicar else 'SIMULACIÓN: no se cambia nada'}", flush=True)
+    uid, models = conectar_odoo()
+    campos = ['id', 'name', 'partner_name', 'street', 'city', 'state_id', 'zip', 'country_id', 'phone', 'description']
+    leads = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
+                              [[['stage_id', '=', ID_ETAPA_REVISAR]]], {'fields': campos, 'limit': 10000, 'order': 'id asc'})
+    print(f"Leads en Revisar: {len(leads)}", flush=True)
+    pasan, quedan = [], []
+    for lead in leads:
+        alcance = clasificar_alcance_geografico(lead)
+        ok, motivo = evaluar_dato_de_google_maps(lead, alcance) if ACEPTAR_DATO_DE_GOOGLE_MAPS else (False, 'desactivado')
+        (pasan if ok else quedan).append((lead, alcance, motivo))
+
+    print(f"\n=== PASAN A CHEQUEADO (celeste): {len(pasan)} ===", flush=True)
+    for lead, _, _ in pasan:
+        print(f"  {lead['id']}  {lead.get('partner_name') or lead.get('name')}", flush=True)
+    resumen = Counter(f"{alc} | {mot}" for _, alc, mot in quedan)
+    print(f"\n=== SE QUEDAN EN REVISAR: {len(quedan)} ===", flush=True)
+    for clave, cant in resumen.most_common():
+        print(f"{cant:4d}  {clave}", flush=True)
+    print("\nDetalle de los que se quedan:", flush=True)
+    for lead, alc, mot in quedan:
+        print(f"  {lead['id']} | {lead.get('partner_name') or lead.get('name')} | {alc} | {mot} | {lead.get('street') or 'S/D'}", flush=True)
+
+    if not aplicar:
+        print("\nSIMULACIÓN: no se modificó nada. Para aplicar, ejecutá de nuevo eligiendo aplicar = si.", flush=True)
+        return
+    for lead, _, motivo in pasan:
+        models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], {'stage_id': ID_ETAPA_CHEQUEADO}])
+        registrar_nota(models, uid, lead['id'], "Agente de Verificación: APROBADO CON DATO DE GOOGLE MAPS (celeste): pasa a Chequeado con confianza media. " + motivo + " No se buscó una segunda fuente en esta reclasificación.")
+        marcar_color(models, uid, lead['id'], COLOR_DATO_GOOGLE_MAPS)
+    print(f"\nListo: {len(pasan)} leads pasaron a Chequeado (celeste).", flush=True)
+
+
 def ejecutar_agente():
     if not ID_ETAPA_REVISAR:
         raise SystemExit("Falta configurar ID_ETAPA_REVISAR (el número de la etapa 'Revisar' en Odoo). No se hizo ningún cambio.")
@@ -1244,7 +1346,7 @@ def ejecutar_agente():
     #   - No verificado o fuera de Córdoba Capital -> Revisar (para revisión manual).
     # Las etiquetas nunca se modifican y no se crean leads nuevos.
     id_prospectos = ID_ETAPA_PROSPECTOS
-    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color']
+    campos = ['id', 'name', 'partner_name', 'contact_name', 'email_from', 'phone', 'website', 'street', 'city', 'state_id', 'zip', 'country_id', 'tag_ids', 'stage_id', 'color', 'description']
 
     todos_los_leads = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'search_read',
@@ -1266,6 +1368,16 @@ def ejecutar_agente():
         fecha = mensaje.get('date') or ''
         if res_id and (res_id not in ultima_auditoria or fecha > ultima_auditoria[res_id]):
             ultima_auditoria[res_id] = fecha
+
+    # Cuántas veces el buscador no devolvió nada para cada lead (esas notas no cuentan como auditoría).
+    intentos_sin_evidencia = Counter(
+        m['res_id'] for m in models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY, 'mail.message', 'search_read',
+            [[['model', '=', 'crm.lead'], ['body', 'ilike', 'Agente de Verificación:'],
+              ['body', 'ilike', 'no devolvió evidencia suficiente']]],
+            {'fields': ['res_id'], 'limit': 20000}
+        ) if m.get('res_id')
+    )
 
     limite_pendientes = (datetime.now(timezone.utc) - timedelta(hours=HORAS_REINTENTO_PENDIENTES)).strftime('%Y-%m-%d %H:%M:%S')
 
@@ -1306,6 +1418,7 @@ def ejecutar_agente():
         return
 
     aprobados = 0          # pasaron a Chequeado en verde
+    aprobados_gm = 0       # pasaron a Chequeado en celeste (dato de Google Maps sin segunda fuente)
     a_revisar = 0          # pasaron a Revisar (no verificados)
     pendientes = 0         # siguen en Prospectos por un error
     procesados = 0
@@ -1322,6 +1435,7 @@ def ejecutar_agente():
 
         inicio_lead = time.time()
         print(f"\n--- Auditando Lead ID {lead['id']}: {lead['name']} [{lead.get('_etiquetas') or 'sin etiqueta'}] (Dir: {lead.get('street') or 'S/D'}) ---", flush=True)
+        vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
         try:
             alcance = clasificar_alcance_geografico(lead)
 
@@ -1350,7 +1464,6 @@ def ejecutar_agente():
             sin_buscador_seguidos = 0  # el buscador respondió: se reinicia el contador de bloqueo
             # Gemini solo se consulta si la búsqueda halló algo que confirmar (email, celular nuevo
             # o el celular ya cargado visto junto al comercio): si no hay nada, no puede aportar.
-            vacio = SimpleNamespace(email_elegido='', telefono_elegido='', coincide_ubicacion_y_rubro=False, motivo='')
             previa = evaluar_evidencia(lead, info_ddgs, vacio, alcance)
             if previa['email'] or previa['telefono'] or previa['tel_cargado']:
                 resultado = analizar_lead_con_google_search_y_ia(lead, info_ddgs)
@@ -1358,19 +1471,28 @@ def ejecutar_agente():
                 resultado = vacio
 
         except BusquedaSinEvidencia as e:
-            # El buscador no devolvió NADA para este lead: casi seguro está bloqueado.
-            # No se modifica el lead (ni nota ni color ni etapa); se salta y se cuenta.
-            fallas_busqueda += 1
-            sin_buscador_seguidos += 1
-            print(f"BUSQUEDA SIN RESULTADOS ({sin_buscador_seguidos}/{MAX_SIN_BUSCADOR_SEGUIDOS}). El lead no se modifica: {e}", flush=True)
-            if sin_buscador_seguidos >= MAX_SIN_BUSCADOR_SEGUIDOS:
-                motivo_corte = (
-                    f"BUSCADOR BLOQUEADO: {MAX_SIN_BUSCADOR_SEGUIDOS} leads seguidos sin ningún resultado. "
-                    "Se aborta la corrida para no perder horas; se reintenta en la próxima."
-                )
-                print(f"\n{motivo_corte}", flush=True)
-                break
-            continue
+            intentos_previos = intentos_sin_evidencia.get(lead['id'], 0)
+            if intentos_previos >= INTENTOS_SIN_RESULTADOS_ANTES_DE_DECIDIR:
+                # Ya se intentó en varias corridas y el buscador nunca devuelve nada para este lead: no es un bloqueo,
+                # es un comercio sin presencia en internet. Se decide con los datos de Odoo para no dejarlo en Prospectos.
+                print(f"Sin resultados del buscador por {intentos_previos + 1}ª vez: se decide con los datos de Odoo.", flush=True)
+                info_ddgs = ''
+                resultado = vacio
+            else:
+                # El buscador no devolvió NADA para este lead: puede ser un bloqueo. No se cambia etapa ni color;
+                # se deja una nota (que no cuenta como auditoría) y se reintenta en la próxima corrida.
+                fallas_busqueda += 1
+                sin_buscador_seguidos += 1
+                print(f"BUSQUEDA SIN RESULTADOS ({sin_buscador_seguidos}/{MAX_SIN_BUSCADOR_SEGUIDOS}). El lead no se modifica: {e}", flush=True)
+                registrar_nota(models, uid, lead['id'], f"Agente de Verificación: la búsqueda no devolvió evidencia suficiente (intento {intentos_previos + 1}). El lead no se modificó y se reintentará en la próxima corrida.")
+                if sin_buscador_seguidos >= MAX_SIN_BUSCADOR_SEGUIDOS:
+                    motivo_corte = (
+                        f"BUSCADOR BLOQUEADO: {MAX_SIN_BUSCADOR_SEGUIDOS} leads seguidos sin ningún resultado. "
+                        "Se aborta la corrida para no perder horas; se reintenta en la próxima."
+                    )
+                    print(f"\n{motivo_corte}", flush=True)
+                    break
+                continue
         except CuotaGeminiAgotada as e:
             motivo_corte = f"CUOTA/LÍMITE GEMINI ALCANZADO. Se detiene toda la ejecución para proteger los pendientes: {e}"
             print(motivo_corte, flush=True)
@@ -1415,6 +1537,12 @@ def ejecutar_agente():
             contacto_verificado
         )
 
+        # Segundo nivel: dato cargado desde Google Maps sin una segunda fuente que lo confirme (celeste).
+        via_google_maps, motivo_google_maps = False, ''
+        if not aprobado_final and ACEPTAR_DATO_DE_GOOGLE_MAPS:
+            via_google_maps, motivo_google_maps = evaluar_dato_de_google_maps(lead, alcance)
+        pasa_a_chequeado = aprobado_final or via_google_maps
+
         partes_nota = []
         extra_nota = []
         valores_actualizar = {}
@@ -1428,10 +1556,12 @@ def ejecutar_agente():
             if telefono_actual:
                 extra_nota.append(f"El teléfono anterior era {telefono_actual}.")
         # Verificado -> Chequeado (verde); no verificado -> Revisar (revisión manual).
-        valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO if aprobado_final else ID_ETAPA_REVISAR
+        valores_actualizar['stage_id'] = ID_ETAPA_CHEQUEADO if pasa_a_chequeado else ID_ETAPA_REVISAR
 
         if aprobado_final:
             partes_nota.append("APROBADO (verde): contacto verificado con evidencia. Pasa a Chequeado.")
+        elif via_google_maps:
+            partes_nota.append("APROBADO CON DATO DE GOOGLE MAPS (celeste): pasa a Chequeado con confianza media. " + motivo_google_maps)
         else:
             partes_nota.append("PENDIENTE: no se pudo verificar. Pasa a Revisar para revisión manual.")
         if email_confirmado:
@@ -1445,7 +1575,7 @@ def ejecutar_agente():
         partes_nota.extend(extra_nota)
         if sin_aplicar:
             partes_nota.append("NO se cambió porque no salió de la web propia del comercio y Odoo ya tenía otro dato: " + "; ".join(sin_aplicar) + ".")
-        if not aprobado_final:
+        if not pasa_a_chequeado or via_google_maps:
             faltantes = []
             if not contacto_verificado:
                 faltantes.append("no se confirmó email ni celular en una página que pertenezca claramente al comercio")
@@ -1453,7 +1583,10 @@ def ejecutar_agente():
                 faltantes.append("el nombre no apareció junto a la calle, el teléfono cargado o una web propia")
             if contacto_verificado and not resultado.coincide_ubicacion_y_rubro:
                 faltantes.append("no coincide ubicación o rubro")
-            partes_nota.append("No pasa a Chequeado: " + ", ".join(faltantes or ["validación insuficiente"]) + ".")
+            if not via_google_maps:
+                partes_nota.append("No pasa a Chequeado: " + ", ".join(faltantes or ["validación insuficiente"]) + ".")
+            else:
+                partes_nota.append("No se halló una segunda fuente en internet para confirmar los datos.")
             if evidencia['candidatos']:
                 lista = "; ".join(f"{e} (visto en {u or 'resultado de búsqueda'})" for e, u in evidencia['candidatos'])
                 partes_nota.append(f"Emails vistos sin respaldo suficiente (una sola fuente no propia): {lista}.")
@@ -1466,7 +1599,7 @@ def ejecutar_agente():
             partes_nota.append("Georef no confirmó la dirección exacta; se exigió que cada fuente nombrara Córdoba o la calle y número.")
 
         print(
-            f"Resultado: Aprobado={aprobado_final} | Email={email_confirmado} | Celular={telefono_confirmado} "
+            f"Resultado: Aprobado={aprobado_final} | Celeste(Google Maps)={via_google_maps} | Email={email_confirmado} | Celular={telefono_confirmado} "
             f"| Tiempo del lead: {int(time.time() - inicio_lead)} s",
             flush=True
         )
@@ -1474,17 +1607,19 @@ def ejecutar_agente():
         models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, 'crm.lead', 'write', [[lead['id']], valores_actualizar])
 
         registrar_nota(models, uid, lead['id'], "Agente de Verificación: " + " ".join(partes_nota))
-        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else COLOR_PENDIENTE)
+        marcar_color(models, uid, lead['id'], COLOR_APROBADO if aprobado_final else (COLOR_DATO_GOOGLE_MAPS if via_google_maps else COLOR_PENDIENTE))
 
         procesados += 1
         if aprobado_final:
             aprobados += 1
+        elif via_google_maps:
+            aprobados_gm += 1
         else:
             a_revisar += 1
 
     minutos = int((time.time() - INICIO_EJECUCION) / 60)
     print(
-        f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | verdes_en_Chequeado={aprobados} "
+        f"\nRESUMEN ({minutos} min): lote={len(leads)} | auditados={procesados} | verdes_en_Chequeado={aprobados} | celestes_en_Chequeado={aprobados_gm} "
         f"| pasados_a_Revisar={a_revisar} (de ellos fuera_alcance={fuera_alcance}) | siguen_en_Prospectos_por_error={pendientes} "
         f"| sin_resultados_del_buscador={fallas_busqueda} | sin_tocar={len(leads) - procesados - fallas_busqueda - pendientes}",
         flush=True
@@ -1494,4 +1629,7 @@ def ejecutar_agente():
 
 
 if __name__ == "__main__":
-    ejecutar_agente()
+    if os.environ.get("MODO") == "reclasificar":
+        reclasificar_revisar(aplicar=os.environ.get("APLICAR") == "1")
+    else:
+        ejecutar_agente()
