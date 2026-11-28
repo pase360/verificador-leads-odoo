@@ -1,0 +1,33 @@
+name: Reclasificar leads en Revisar
+
+on:
+  workflow_dispatch:
+    inputs:
+      aplicar:
+        description: 'si = mueve los leads en Odoo / no = solo muestra qué haría (simulación)'
+        type: choice
+        options:
+          - 'no'
+          - 'si'
+        default: 'no'
+
+jobs:
+  reclasificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+      - name: Ejecuta la reclasificación
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MODO: reclasificar
+          APLICAR: ${{ github.event.inputs.aplicar == 'si' && '1' || '0' }}
+        run: python agente_leads.py
