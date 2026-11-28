@@ -1,0 +1,25 @@
+name: Reporte de leads en Revisar
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reporte:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Ejecuta reporte_revisar.py
+        env:
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USER: ${{ secrets.ODOO_USER }}
+          ODOO_API_KEY: ${{ secrets.ODOO_API_KEY }}
+        run: python reporte_revisar.py
+      - name: Guardar el CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte_revisar
+          path: reporte_revisar.csv
